@@ -1,0 +1,17 @@
+{
+  "name": "noliric",
+  "version": "1.0.0",
+  "private": true,
+  "description": "noliric — угадай трек по инструменталу (Telegram-бот @noliricapp)",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "init-db": "node bot.js --init-db"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  }
+}

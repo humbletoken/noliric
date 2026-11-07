@@ -1,0 +1,37 @@
+# ─── Telegram ───
+BOT_TOKEN=9111123731:AAGxtmtjHf4CRRmfYxRfRrlnYOLrcwxNO98
+ADMIN_IDS=7029771876
+BOT_USERNAME=noliricapp
+
+# ─── База и файлы ───
+# В Docker DATA_DIR=/app/data задан в образе — здесь не переопределяй.
+# DB_PATH=./data/noliric.db
+CACHE_MAX_MB=3072
+
+# ─── Музыка: auto (Deezer → iTunes) | deezer | itunes ───
+MUSIC_SOURCE=auto
+ITUNES_COUNTRY=us
+ALBUMS_PER_ARTIST=15
+
+# ─── Игра ───
+ANSWER_SECONDS=30
+MAX_ACTIVE_GAMES=25
+PREFETCH=2
+RICH_MESSAGES=1
+
+# ─── Отделение вокала ───
+# deux = becruily/mel-band-roformer-deux (скачается с Hugging Face при первом запуске)
+SEP_MODEL=deux
+SEP_FALLBACK_MODEL=mel_band_roformer_instrumental_becruily.ckpt
+SEP_WORKERS=1
+# потоков на воркер (0 = все ядра); SEP_WORKERS × SEP_THREADS ≈ число ядер
+SEP_THREADS=0
+# меньше = быстрее на CPU (2–4), пусто = как в конфиге модели
+SEP_OVERLAP=2
+SEP_TIMEOUT=420
+HF_TOKEN=
+
+# ─── Премиум-эмодзи ───
+EMOJI_PACK=random99_by_emsetbot
+
+LOG_LEVEL=info
