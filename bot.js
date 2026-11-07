@@ -786,6 +786,8 @@ class SepWorker {
     readline.createInterface({ input: proc.stderr }).on('line', (raw) => {
       const l = raw.split('\r').pop().trim();
       if (!l || /\d+%\|/.test(l)) return; // прогресс-бары tqdm
+      const fatal = l.match(/\[sep\] (?:fatal:|model '.*' failed:)\s*(.+)$/);
+      if (fatal && SEP.errors[0]?.message !== cut(fatal[1], 300)) sepError('model', null, fatal[1]);
       (/\[sep\]|error|exception|traceback|failed|killed/i.test(l) ? log.info : log.debug)(`[sep${this.n}] ${cut(l, 400)}`);
     });
     proc.on('error', (err) => {

@@ -16,11 +16,13 @@ RUN apt-get update \
       ffmpeg ca-certificates python3 python3-venv python3-dev build-essential libsndfile1 libsamplerate0 \
  && rm -rf /var/lib/apt/lists/*
 
-# PyTorch (CPU) + audio-separator
+# PyTorch + torchvision (CPU, одной парой версий) + audio-separator.
+# torchvision тянет onnx2torch: если он придёт с PyPI отдельно — «torchvision::nms does not exist».
 RUN python3 -m venv /opt/venv \
  && pip install --upgrade pip setuptools wheel \
- && pip install torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install "audio-separator[cpu]==0.48.0"
+ && pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu \
+ && pip install "audio-separator[cpu]==0.48.0" --extra-index-url https://download.pytorch.org/whl/cpu \
+ && python -c "import torch, torchvision; from audio_separator.separator import Separator; print('torch', torch.__version__, '| torchvision', torchvision.__version__)"
 
 # Модели скачиваются при сборке — бот стартует сразу
 RUN mkdir -p /opt/models \
