@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 /*
- * noliric — угадай трек по инструменталу · @noliricapp
- * Telegram Bot API 10.3 · Node.js 22+ · better-sqlite3 · ffmpeg · audio-separator (Mel-Band RoFormer)
+ * noliric — угадай трек по секунде · @noliricapp
+ * Telegram Bot API 10.3 · Node.js 22+ · better-sqlite3 · ffmpeg
  *
- * Поток: исполнитель/альбом → треки (Deezer, запасной — iTunes) → случайный трек →
- * нейросеть вырезает вокал → фрагмент 10–20 сек → квиз-опрос на 30 сек → очки.
+ * Поток: исполнитель/альбом → треки (Deezer, запасной — iTunes) → превью →
+ * один проход ffmpeg режет 4 уровня (1 сек начало+конец, 3, 5, 10 сек) → квиз на 30 сек.
+ * Чем длиннее фрагмент понадобился — тем меньше очков; на 10 сек — ноль.
+ * Готовые фрагменты кэшируются на диске и по file_id в Telegram — повторные треки летят мгновенно.
  */
 
 const fs = require('node:fs');
@@ -37,29 +39,14 @@ const CFG = {
   answerSec: Math.min(600, Math.max(10, envInt('ANSWER_SECONDS', 30))),
   maxGames: envInt('MAX_ACTIVE_GAMES', 25),
   prefetch: Math.max(0, envInt('PREFETCH', 2)),
-  python: env('PYTHON_BIN', 'python3'),
-  sepModel: env('SEP_MODEL', 'UVR-MDX-NET-Inst_HQ_4.onnx'),
-  sepFallback: env('SEP_FALLBACK_MODEL', 'UVR-MDX-NET-Inst_HQ_3.onnx'),
-  sepWorkers: Math.max(1, envInt('SEP_WORKERS', 1)),
-  sepTimeout: Math.max(60, envInt('SEP_TIMEOUT', 420)),
-  sepWindow: Math.min(30, Math.max(12, envInt('SEP_WINDOW', 22))),
-  sepEngine: env('SEP_ENGINE', 'local').toLowerCase(),
-  mvsep: {
-    token: env('MVSEP_TOKEN'),
-    host: env('MVSEP_HOST', 'https://mvsep.com').replace(/\/+$/, ''),
-    sepType: env('MVSEP_SEP_TYPE', '48'),
-    opt1: env('MVSEP_OPT1', '11'),
-    opt2: env('MVSEP_OPT2'),
-    concurrency: envInt('MVSEP_CONCURRENCY', 1),
-    poll: Math.max(2, envInt('MVSEP_POLL_SEC', 3)),
-  },
-  cacheMaxMb: envInt('CACHE_MAX_MB', 3072),
+  prepConcurrency: Math.max(1, envInt('PREP_CONCURRENCY', 4)),
+  points: env('LEVEL_POINTS', '100,60,30,0').split(',').map((n) => Math.max(0, parseInt(n, 10) || 0)),
+  cacheMaxMb: envInt('CACHE_MAX_MB', 1024),
   emojiPack: env('EMOJI_PACK', 'random99_by_emsetbot'),
   rich: env('RICH_MESSAGES', '1') !== '0',
   logLevel: env('LOG_LEVEL', 'info'),
 };
-const DIRS = { cache: path.join(DATA_DIR, 'cache'), tmp: path.join(DATA_DIR, 'tmp'), models: path.resolve(__dirname, env('SEP_MODEL_DIR', path.join(DATA_DIR, 'models'))) };
-const WORKER_FILE = path.join(DATA_DIR, 'separator_worker.py');
+const DIRS = { clips: path.join(DATA_DIR, 'clips'), tmp: path.join(DATA_DIR, 'tmp') };
 
 /* ═══════════════════════════ utils ═══════════════════════════ */
 
@@ -350,24 +337,30 @@ CREATE TABLE IF NOT EXISTS rounds (
   correct    INTEGER NOT NULL DEFAULT 0,
   points     INTEGER NOT NULL DEFAULT 0,
   hint       INTEGER NOT NULL DEFAULT 0,
+  level      INTEGER NOT NULL DEFAULT 0,
   ms         INTEGER,
   created_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS instrumentals (
+CREATE TABLE IF NOT EXISTS clip_files (
   track_key  TEXT PRIMARY KEY,
-  path       TEXT NOT NULL,
-  model      TEXT,
   bytes      INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
-  last_used  INTEGER NOT NULL,
-  uses       INTEGER NOT NULL DEFAULT 0
+  last_used  INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS clips (
+  track_key  TEXT NOT NULL,
+  level      INTEGER NOT NULL,
+  file_id    TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (track_key, level)
+);
+DROP TABLE IF EXISTS instrumentals;
 CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS idx_users_score  ON users(score DESC);
 CREATE INDEX IF NOT EXISTS idx_users_streak ON users(best_streak DESC);
 CREATE INDEX IF NOT EXISTS idx_games_user   ON games(user_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_rounds_game  ON rounds(game_id);
-CREATE INDEX IF NOT EXISTS idx_instr_used   ON instrumentals(last_used);
+CREATE INDEX IF NOT EXISTS idx_files_used   ON clip_files(last_used);
 `;
 
 let db; let Q;
@@ -380,6 +373,7 @@ function initDb() {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
   db.exec(SCHEMA);
+  if (!db.prepare('PRAGMA table_info(rounds)').all().some((c) => c.name === 'level')) db.exec('ALTER TABLE rounds ADD COLUMN level INTEGER NOT NULL DEFAULT 0');
   db.prepare('INSERT OR IGNORE INTO kv (k, v) VALUES (?, ?)').run('schema_version', '1');
   Q = {
     upsertUser: db.prepare(`INSERT INTO users (id, username, first_name, created_at, last_seen)
@@ -394,22 +388,23 @@ function initDb() {
       VALUES (?, ?, ?, ?, ?, ?, ?)`),
     gameEnd: db.prepare(`UPDATE games SET played = @played, score = @score, correct = @correct, wrong = @wrong,
       best_streak = @best, status = @status, end_reason = @reason, finished_at = @now WHERE id = @id`),
-    roundAdd: db.prepare(`INSERT INTO rounds (game_id, idx, track_key, title, answer, correct, points, hint, ms, created_at)
-      VALUES (@game, @idx, @key, @title, @answer, @correct, @points, @hint, @ms, @now)`),
+    roundAdd: db.prepare(`INSERT INTO rounds (game_id, idx, track_key, title, answer, correct, points, hint, level, ms, created_at)
+      VALUES (@game, @idx, @key, @title, @answer, @correct, @points, @hint, @level, @ms, @now)`),
     userStats: db.prepare(`UPDATE users SET games = games + 1, score = score + @score, correct = correct + @correct,
       wrong = wrong + @wrong, best_streak = MAX(best_streak, @streak), best_hardcore = MAX(best_hardcore, @hardcore)
       WHERE id = @id`),
     abortStale: db.prepare(`UPDATE games SET status = 'aborted', end_reason = 'restart', finished_at = ? WHERE status = 'active'`),
-    cacheGet: db.prepare('SELECT * FROM instrumentals WHERE track_key = ?'),
-    cachePut: db.prepare(`INSERT INTO instrumentals (track_key, path, model, bytes, created_at, last_used)
-      VALUES (@key, @path, @model, @bytes, @now, @now)
-      ON CONFLICT(track_key) DO UPDATE SET path = excluded.path, model = excluded.model, bytes = excluded.bytes,
-        last_used = excluded.last_used`),
-    cacheTouch: db.prepare('UPDATE instrumentals SET last_used = ?, uses = uses + 1 WHERE track_key = ?'),
-    cacheDel: db.prepare('DELETE FROM instrumentals WHERE track_key = ?'),
-    cacheStats: db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS bytes FROM instrumentals'),
-    cacheLru: db.prepare('SELECT track_key, path, bytes FROM instrumentals ORDER BY last_used ASC LIMIT 300'),
-    cacheAll: db.prepare('SELECT track_key, path FROM instrumentals'),
+    filesPut: db.prepare(`INSERT INTO clip_files (track_key, bytes, created_at, last_used) VALUES (@key, @bytes, @now, @now)
+      ON CONFLICT(track_key) DO UPDATE SET bytes = excluded.bytes, last_used = excluded.last_used`),
+    filesTouch: db.prepare('UPDATE clip_files SET last_used = ? WHERE track_key = ?'),
+    filesDel: db.prepare('DELETE FROM clip_files WHERE track_key = ?'),
+    filesStats: db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS bytes FROM clip_files'),
+    filesLru: db.prepare('SELECT track_key, bytes FROM clip_files ORDER BY last_used ASC LIMIT 300'),
+    filesAll: db.prepare('SELECT track_key FROM clip_files'),
+    clipsGet: db.prepare('SELECT level, file_id FROM clips WHERE track_key = ?'),
+    clipPut: db.prepare('INSERT OR REPLACE INTO clips (track_key, level, file_id, created_at) VALUES (?, ?, ?, ?)'),
+    clipDel: db.prepare('DELETE FROM clips WHERE track_key = ?'),
+    clipStats: db.prepare('SELECT COUNT(DISTINCT track_key) AS n FROM clips'),
     stats: db.prepare(`SELECT
       (SELECT COUNT(*) FROM users) AS users,
       (SELECT COUNT(*) FROM users WHERE last_seen > @day) AS users24,
@@ -586,481 +581,103 @@ async function loadPool(item) {
 }
 const itemName = (it) => (it.type === 'album' && it.artist ? `${it.name} — ${it.artist}` : it.name);
 
-/* ═══════════════════════════ отделение вокала ═══════════════════════════ */
+/* ═══════════════════════════ фрагменты ═══════════════════════════ */
 
-// Python-воркер держит модель в памяти и общается с ботом JSON-строками через stdin/stdout.
-// SEP_MODEL=deux → becruily/mel-band-roformer-deux с Hugging Face (подключается в audio-separator вручную),
-// при ошибке — SEP_FALLBACK_MODEL из реестра audio-separator (Mel-Roformer Instrumental by becruily).
-const WORKER_PY = String.raw`# noliric · separator worker (генерируется bot.js при старте — не редактировать)
-import os, sys, json, time, shutil, logging, traceback
+// Уровни как в Heardle: 1 сек (начало + конец превью), первые 3, 5, 10 сек.
+// Очки — за уровень, на котором дан ответ: чем длиннее фрагмент, тем меньше; на 10 сек — ноль.
+const LEVELS = [
+  { dur: 1, label: '1 сек', caption: '1 сек · начало и конец' },
+  { dur: 3, label: '3 сек', caption: 'Первые 3 сек' },
+  { dur: 5, label: '5 сек', caption: 'Первые 5 сек' },
+  { dur: 10, label: '10 сек', caption: 'Первые 10 сек' },
+].map((l, i) => ({ ...l, pts: CFG.points[i] ?? 0 }));
 
-_PROTO = os.fdopen(os.dup(1), "w", buffering=1)
-os.dup2(2, 1)
-sys.stdout = sys.stderr
-
-def log(*a):
-    print("[sep]", *a, file=sys.stderr, flush=True)
-
-def reply(obj):
-    _PROTO.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    _PROTO.flush()
-
-MODEL = (os.environ.get("SEP_MODEL") or "deux").strip()
-FALLBACK = (os.environ.get("SEP_FALLBACK_MODEL") or "").strip()
-MODEL_DIR = os.environ.get("SEP_MODEL_DIR") or "/app/data/models"
-WORK_DIR = os.environ.get("SEP_WORK_DIR") or "/tmp/noliric-sep"
-DEUX_REPO = os.environ.get("DEUX_REPO") or "becruily/mel-band-roformer-deux"
-HF = (os.environ.get("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(WORK_DIR, exist_ok=True)
-
-THREADS = int(os.environ.get("SEP_THREADS") or 0) or (os.cpu_count() or 2)
-try:
-    import torch
-    torch.set_num_threads(THREADS)
-except Exception as e:
-    log("torch:", e)
-
-from audio_separator.separator import Separator
-
-CUSTOM = {}
-
-def hf_headers():
-    tok = os.environ.get("HF_TOKEN")
-    return {"Authorization": "Bearer " + tok} if tok else {}
-
-def download(url, dst):
-    import requests
-    tmp = dst + ".part"
-    with requests.get(url, stream=True, timeout=60, headers=hf_headers()) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length") or 0)
-        done, last = 0, 0.0
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(1 << 20):
-                f.write(chunk)
-                done += len(chunk)
-                if time.time() - last > 5:
-                    last = time.time()
-                    log("download %s: %d/%d MB" % (os.path.basename(dst), done >> 20, total >> 20))
-    os.replace(tmp, dst)
-
-def ensure_deux():
-    ckpt_name = "mel_band_roformer_deux_becruily.ckpt"
-    cfg_name = "config_mel_band_roformer_deux_becruily.yaml"
-    ckpt, cfg = os.path.join(MODEL_DIR, ckpt_name), os.path.join(MODEL_DIR, cfg_name)
-    if not (os.path.exists(ckpt) and os.path.exists(cfg)):
-        import requests
-        info = requests.get(HF + "/api/models/" + DEUX_REPO, timeout=30, headers=hf_headers()).json()
-        files = [s.get("rfilename", "") for s in info.get("siblings", [])]
-        def pick(exact, exts):
-            if exact in files:
-                return exact
-            c = [f for f in files if f.lower().endswith(exts)]
-            c.sort(key=lambda f: (0 if "deux" in f.lower() else 1, len(f)))
-            return c[0] if c else None
-        c = os.environ.get("DEUX_CKPT") or pick("becruily_deux.ckpt", (".ckpt", ".pth", ".pt"))
-        y = os.environ.get("DEUX_CONFIG") or pick("config_deux_becruily.yaml", (".yaml", ".yml"))
-        if not c or not y:
-            raise RuntimeError("model files not found in %s: %s" % (DEUX_REPO, files))
-        if not os.path.exists(cfg):
-            download("%s/%s/resolve/main/%s" % (HF, DEUX_REPO, y), cfg)
-        if not os.path.exists(ckpt):
-            download("%s/%s/resolve/main/%s" % (HF, DEUX_REPO, c), ckpt)
-    CUSTOM[ckpt_name] = cfg_name
-    return ckpt_name
-
-_orig_download = Separator.download_model_files
-
-def _download_model_files(self, model_filename):
-    if model_filename in CUSTOM:
-        self.model_friendly_name = "MelBand Roformer | Deux by becruily"
-        self.model_is_uvr_vip = False
-        return (model_filename, "MDXC", self.model_friendly_name,
-                os.path.join(self.model_file_dir, model_filename), CUSTOM[model_filename])
-    return _orig_download(self, model_filename)
-
-Separator.download_model_files = _download_model_files
-
-def build(model):
-    mdxc = {"segment_size": 256, "override_model_segment_size": False, "batch_size": 1, "overlap": None, "pitch_shift": 0}
-    if os.environ.get("SEP_OVERLAP"):
-        mdxc["overlap"] = int(os.environ["SEP_OVERLAP"])
-    sep = Separator(log_level=logging.WARNING, model_file_dir=MODEL_DIR, output_dir=WORK_DIR,
-                    output_format="WAV", mdxc_params=mdxc)
-    sep.load_model(model_filename=model)
-    return sep
-
-def pick_instrumental(files):
-    named = [(f, os.path.basename(f).lower()) for f in files]
-    for keys in (("instrument",), ("(other)", "_other", "no_vocals", "no vocals", "karaoke")):
-        for f, n in named:
-            if any(k in n for k in keys):
-                return f
-    for f, n in named:
-        if "vocal" not in n:
-            return f
-    return None
-
-def main():
-    want, fallback = MODEL, False
-    try:
-        if want.lower() in ("deux", "becruily-deux", "mel_band_roformer_deux_becruily.ckpt"):
-            want = ensure_deux()
-        sep = build(want)
-    except Exception as e:
-        log("model '%s' failed: %s" % (want, e))
-        traceback.print_exc()
-        if not FALLBACK or FALLBACK == want:
-            raise
-        want, fallback = FALLBACK, True
-        sep = build(want)
-    reply({"ready": True, "model": want, "fallback": fallback})
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except Exception:
-            continue
-        rid, t0 = req.get("id"), time.time()
-        try:
-            files = sep.separate(req["input"]) or []
-            files = [f if os.path.isabs(f) else os.path.join(WORK_DIR, f) for f in files]
-            inst = pick_instrumental(files)
-            if not inst or not os.path.exists(inst):
-                raise RuntimeError("instrumental stem not found: %r" % files)
-            shutil.move(inst, req["output"])
-            for f in files:
-                if f != inst and os.path.exists(f):
-                    os.remove(f)
-            reply({"id": rid, "ok": True, "output": req["output"], "sec": round(time.time() - t0, 2)})
-        except Exception as e:
-            traceback.print_exc()
-            reply({"id": rid, "ok": False, "error": ("%s: %s" % (type(e).__name__, e))[:400]})
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        log("fatal:", e)
-        traceback.print_exc()
-        sys.exit(1)
-`;
-
-const SEP = {
-  workers: [], queue: [], jobs: new Map(), bad: new Map(), errors: [],
-  engine: null, account: null, model: null, fallback: false, useFallback: false, broken: null, sepFails: 0,
-  seq: 0, done: 0, failed: 0, totalSec: 0,
-};
-const sepAlive = () => SEP.workers.some((w) => w.alive);
-const STAGES = { download: 'превью', convert: 'ffmpeg', separate: 'нейросеть', encode: 'ffmpeg', memory: 'память', model: 'модель' };
+const PREP = { jobs: new Map(), queue: [], active: 0, bad: new Map(), errors: [], done: 0, failed: 0, totalMs: 0, broken: null, seq: 0 };
+const STAGES = { download: 'превью', cut: 'ffmpeg', send: 'отправка' };
 const mmss = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+const safeKey = (k) => k.replace(/[^a-z0-9_-]/gi, '_');
+const clipDir = (key) => path.join(DIRS.clips, safeKey(key));
+const clipPath = (key, i) => path.join(clipDir(key), `l${i}.mp3`);
 
-/** Последние ошибки — видны в админке, причина попадает и в сообщение об остановке игры. */
-function sepError(stage, track, message) {
-  SEP.errors.unshift({ at: now(), stage, title: track?.title || '', message: cut(String(message), 300) });
-  SEP.errors.length = Math.min(SEP.errors.length, 5);
+function prepError(stage, track, message) {
+  PREP.errors.unshift({ at: now(), stage, title: track?.title || '', message: cut(String(message), 300) });
+  PREP.errors.length = Math.min(PREP.errors.length, 5);
 }
 
-class SepWorker {
-  constructor(n) {
-    Object.assign(this, { n, seq: 0, pending: new Map(), alive: false, busy: false, everReady: false, fails: 0, stopped: false, restarting: false, killedByUs: false, job: null });
-    this.start();
+/** Готовит 4 уровня трека: file_id из Telegram (мгновенно) → файлы на диске → превью + ffmpeg. */
+function prepareTrack(track, priority = 5) {
+  const ids = new Map(Q.clipsGet.all(track.key).map((r) => [r.level, r.file_id]));
+  const onDisk = LEVELS.every((_, i) => fs.existsSync(clipPath(track.key, i)));
+  if (ids.size === LEVELS.length || onDisk) {
+    if (onDisk) Q.filesTouch.run(now(), track.key);
+    return Promise.resolve({ track, levels: LEVELS.map((_, i) => ({ fileId: ids.get(i) || null, path: clipPath(track.key, i) })) });
   }
-
-  start() {
-    this.alive = false; this.everReady = false; this.killedByUs = false;
-    const model = SEP.useFallback ? CFG.sepFallback : CFG.sepModel;
-    const proc = spawn(CFG.python, ['-u', WORKER_FILE], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env, PYTHONUNBUFFERED: '1', SEP_MODEL: model, SEP_FALLBACK_MODEL: CFG.sepFallback,
-        SEP_MODEL_DIR: DIRS.models, SEP_WORK_DIR: path.join(DIRS.tmp, `sep${this.n}`),
-      },
-    });
-    this.proc = proc;
-    proc.stdin.on('error', () => {}); // EPIPE, если процесс уже умер
-    readline.createInterface({ input: proc.stdout }).on('line', (l) => this.onLine(l));
-    readline.createInterface({ input: proc.stderr }).on('line', (raw) => {
-      const l = raw.split('\r').pop().trim();
-      if (!l || /\d+%\|/.test(l)) return; // прогресс-бары tqdm
-      const fatal = l.match(/\[sep\] (?:fatal:|model '.*' failed:)\s*(.+)$/);
-      if (fatal && SEP.errors[0]?.message !== cut(fatal[1], 300)) sepError('model', null, fatal[1]);
-      (/\[sep\]|error|exception|traceback|failed|killed/i.test(l) ? log.info : log.debug)(`[sep${this.n}] ${cut(l, 400)}`);
-    });
-    proc.on('error', (err) => {
-      log.error(`[sep${this.n}] ${err.message}`);
-      if (err.code === 'ENOENT') { SEP.broken = `не найден ${CFG.python}`; pump(); }
-    });
-    proc.on('exit', (code, sig) => {
-      this.alive = false;
-      const oom = sig === 'SIGKILL' && !this.killedByUs;
-      const reason = oom ? 'процесс нейросети убит системой — похоже, не хватает RAM' : `worker exited (${code ?? sig})`;
-      if (oom) sepError('memory', this.job?.track, reason);
-      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(Object.assign(new Error(reason), { crash: true, oom })); }
-      this.pending.clear();
-      if (this.stopped || SEP.broken) return;
-      if (this.restarting) { this.restarting = false; setTimeout(() => this.start(), 500).unref(); return; }
-      this.fails = this.everReady ? 0 : this.fails + 1;
-      if (this.fails >= 3) {
-        SEP.broken = `нейросеть не запускается: ${SEP.errors[0]?.message || 'смотри логи контейнера'}`;
-        log.error(`[sep${this.n}] ${SEP.broken}`); pump(); return;
-      }
-      const delay = Math.min(60, 5 * 2 ** this.fails);
-      log.warn(`[sep${this.n}] ${reason}, restart in ${delay}s`);
-      setTimeout(() => this.start(), delay * 1000).unref();
-    });
-  }
-
-  onLine(line) {
-    let m;
-    try { m = JSON.parse(line); } catch { log.debug(`[sep${this.n}] ${line}`); return; }
-    if (m.ready) {
-      Object.assign(this, { alive: true, everReady: true, fails: 0 });
-      SEP.model = m.model; SEP.fallback = !!m.fallback || m.model === CFG.sepFallback;
-      log.info(`[sep${this.n}] ready · ${m.model}${SEP.fallback ? ' (запасная модель)' : ''}`);
-      pump(); return;
-    }
-    const p = this.pending.get(m.id);
-    if (!p) return;
-    this.pending.delete(m.id); clearTimeout(p.timer);
-    if (m.ok) p.resolve(m); else p.reject(new Error(m.error || 'separation failed'));
-  }
-
-  separate(input, output) {
-    return new Promise((resolve, reject) => {
-      if (!this.alive) { reject(Object.assign(new Error('worker restarting'), { crash: true })); return; }
-      const id = ++this.seq;
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`нейросеть не уложилась в ${CFG.sepTimeout} сек — слабый CPU?`));
-        this.kill();
-      }, CFG.sepTimeout * 1000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.proc.stdin.write(`${JSON.stringify({ id, input, output })}\n`);
-    });
-  }
-
-  kill() { this.killedByUs = true; this.alive = false; try { this.proc.kill('SIGKILL'); } catch { /* ok */ } }
-  restart() { this.restarting = true; this.kill(); }
-  stop() { this.stopped = true; this.kill(); }
-}
-
-/* ─────────── MVSEP: облачное отделение вокала (mvsep.com API) ─────────── */
-// Тот же Mel-Roformer deux от becruily, но на их серверах: RAM на VPS не нужна.
-// Бесплатный аккаунт: 1 задача одновременно, обычная очередь. Premium — без ограничений.
-
-const MVSEP_LABELS = { '48:11': 'MelBand Roformer · becruily deux', '48:7': 'MelBand Roformer · becruily instrum', '48:4': 'MelBand Roformer 2024.10', '40:81': 'BS Roformer' };
-const mvsepLabel = () => `MVSEP · ${MVSEP_LABELS[`${CFG.mvsep.sepType}:${CFG.mvsep.opt1}`] || `sep_type ${CFG.mvsep.sepType}${CFG.mvsep.opt1 ? `/${CFG.mvsep.opt1}` : ''}`}`;
-
-function pickStem(files) {
-  const named = files.map((f) => ({ f, n: `${f.download || ''} ${f.type || ''} ${f.url || ''}`.toLowerCase() }));
-  return (named.find((x) => /instrum/.test(x.n))
-    || named.find((x) => /other|no_?vocals|karaoke|accomp/.test(x.n))
-    || named.find((x) => !/vocal/.test(x.n)))?.f || null;
-}
-
-class MvsepWorker {
-  constructor(n) {
-    Object.assign(this, { n, alive: true, busy: false, job: null, remote: null, inExt: 'flac', outExt: 'mp3' });
-  }
-
-  async api(pathname, { method = 'GET', body, timeout = 30e3 } = {}) {
-    const res = await fetch(`${CFG.mvsep.host}/api/${pathname}`, { method, body, signal: AbortSignal.timeout(timeout) });
-    let j = {};
-    try { j = await res.json(); } catch { /* не JSON */ }
-    if (res.status === 401) {
-      SEP.broken = 'MVSEP: неверный MVSEP_TOKEN'; pump();
-      throw new Error(SEP.broken);
-    }
-    return { status: res.status, j };
-  }
-
-  async separate(input, output) {
-    const m = CFG.mvsep;
-    let hash = null;
-    for (let attempt = 0; attempt < 8 && !hash; attempt++) {
-      const fd = new FormData();
-      fd.append('api_token', m.token);
-      fd.append('sep_type', m.sepType);
-      if (m.opt1) fd.append('add_opt1', m.opt1);
-      if (m.opt2) fd.append('add_opt2', m.opt2);
-      fd.append('output_format', '0'); // mp3 320
-      fd.append('is_demo', '0');
-      fd.append('audiofile', await fs.openAsBlob(input), `noliric_${crypto.randomBytes(4).toString('hex')}.${this.inExt}`);
-      let r;
-      try { r = await this.api('separation/create', { method: 'POST', body: fd, timeout: 90e3 }); } catch (err) {
-        if (SEP.broken) throw err;
-        await sleep(3000); continue;
-      }
-      if (r.j?.success && r.j.data?.hash) { hash = r.j.data.hash; break; }
-      const msg = r.j?.data?.message || r.j?.message || `HTTP ${r.status}`;
-      // 429 / «уже есть активная задача» на бесплатном аккаунте — ждём и пробуем снова
-      if (r.status === 429 || r.status >= 500 || /concurrent|already|limit|queue|wait/i.test(msg)) { await sleep(5000 + attempt * 2000); continue; }
-      throw new Error(`MVSEP: ${msg}`);
-    }
-    if (!hash) throw new Error('MVSEP не принял задачу (лимит одновременных задач?)');
-
-    const deadline = now() + CFG.sepTimeout * 1000;
-    for (;;) {
-      await sleep(m.poll * 1000);
-      if (now() > deadline) throw new Error(`MVSEP не успел за ${CFG.sepTimeout} сек — очередь перегружена`);
-      let r;
-      try { r = await this.api(`separation/get?hash=${encodeURIComponent(hash)}`, { timeout: 20e3 }); } catch (err) {
-        if (SEP.broken) throw err;
-        continue;
-      }
-      const d = r.j?.data || {};
-      const status = r.j?.status || d.status;
-      this.remote = { status, order: d.current_order ?? null, queue: d.queue_count ?? null };
-      if (status === 'done') {
-        const stem = pickStem(Array.isArray(d.files) ? d.files : Object.values(d.files || {}));
-        if (!stem?.url) throw new Error('MVSEP: в ответе нет инструментала');
-        const res = await fetch(String(stem.url).replace(/\\\//g, '/'), { signal: AbortSignal.timeout(60e3) });
-        if (!res.ok) throw new Error(`MVSEP download HTTP ${res.status}`);
-        await fsp.writeFile(output, Buffer.from(await res.arrayBuffer()));
-        this.remote = null;
-        return { ok: true };
-      }
-      if (['failed', 'error', 'not_found'].includes(status)) throw new Error(`MVSEP: ${d.message || status}`);
-    }
-  }
-
-  kill() {} restart() {} stop() { this.alive = false; }
-}
-
-async function checkMvsep() {
-  try {
-    const res = await fetch(`${CFG.mvsep.host}/api/app/user?api_token=${encodeURIComponent(CFG.mvsep.token)}`, { signal: AbortSignal.timeout(15e3) });
-    if (res.status === 401) { SEP.broken = 'MVSEP: неверный MVSEP_TOKEN'; log.error(SEP.broken); return; }
-    const j = await res.json().catch(() => ({}));
-    const u = j.data || j;
-    SEP.account = { premium: !!Number(u.premium_enabled), credits: u.premium_minutes ?? null, name: u.name || null };
-    log.info(`MVSEP: ${u.name || 'аккаунт'} · premium ${SEP.account.premium ? 'вкл' : 'выкл'}${SEP.account.credits != null ? ` · кредитов ${SEP.account.credits}` : ''}`);
-  } catch (err) { log.warn(`MVSEP check: ${err.message}`); }
-}
-
-function startSeparator() {
-  if (CFG.sepEngine === 'mvsep' && CFG.mvsep.token) {
-    SEP.engine = 'mvsep'; SEP.model = mvsepLabel();
-    for (let i = 0; i < Math.max(1, CFG.mvsep.concurrency); i++) SEP.workers.push(new MvsepWorker(i + 1));
-    log.info(`separator: ${SEP.model} · задач одновременно: ${SEP.workers.length}`);
-    checkMvsep();
-    return;
-  }
-  if (CFG.sepEngine === 'mvsep') log.warn('MVSEP_TOKEN не задан — пробую локальную модель');
-  SEP.engine = 'local';
-  fs.writeFileSync(WORKER_FILE, WORKER_PY);
-  for (let i = 0; i < CFG.sepWorkers; i++) SEP.workers.push(new SepWorker(i + 1));
-}
-
-/** Статус задачи для анимированного черновика. */
-function jobStatus(key) {
-  if (!sepAlive()) return 'Загружаю нейросеть';
-  const pos = queuePos(key);
-  if (pos > 1) return `В очереди · ${pos}`;
-  const w = SEP.workers.find((x) => x.job?.key === key);
-  if (w?.remote?.status === 'waiting' || w?.remote?.status === 'distributing') {
-    return w.remote.order ? `Очередь MVSEP · ${w.remote.order}` : 'Очередь MVSEP';
-  }
-  return 'Отделяю вокал';
-}
-
-/** Основная модель падает на треках → переключаемся на запасную из реестра audio-separator. */
-function onSeparationFailure(err) {
-  if (SEP.engine !== 'local') return; // облако: сбои разовые, игра просто берёт другой трек
-  SEP.sepFails++;
-  const onFallback = SEP.useFallback || SEP.fallback;
-  if (!onFallback && CFG.sepFallback && SEP.sepFails >= 2 && !err.oom) {
-    SEP.useFallback = true; SEP.sepFails = 0;
-    sepError('model', null, `${SEP.model} падает на треках — переключаюсь на ${CFG.sepFallback}`);
-    log.warn(`switching to fallback model ${CFG.sepFallback}`);
-    for (const w of SEP.workers) w.restart();
-  } else if (SEP.sepFails >= 4) {
-    SEP.broken = err.oom ? 'не хватает оперативной памяти для нейросети' : `нейросеть не справляется: ${cut(err.message, 160)}`;
-    log.error(SEP.broken); pump();
-  }
-}
-
-function pump() {
-  if (SEP.broken) { for (const j of SEP.queue.splice(0)) j.reject(new Error(SEP.broken)); return; }
-  for (const w of SEP.workers) {
-    if (!w.alive || w.busy || !SEP.queue.length) continue;
-    SEP.queue.sort((a, b) => a.priority - b.priority || a.seq - b.seq);
-    const job = SEP.queue.shift();
-    w.busy = true; w.job = job; job.started = now();
-    processJob(w, job).then(job.resolve, (err) => {
-      if (err.crash && !err.oom && (job.retries = (job.retries || 0) + 1) <= 2) { job.started = 0; SEP.queue.push(job); return; }
-      job.reject(err);
-    }).finally(() => { w.busy = false; w.job = null; setImmediate(pump); });
-  }
-}
-
-function queuePos(key) {
-  const job = SEP.jobs.get(key);
-  if (!job || job.started) return 0;
-  return [...SEP.queue].sort((a, b) => a.priority - b.priority || a.seq - b.seq).indexOf(job) + 1;
-}
-
-/** Путь к mp3 инструментала (кэш → очередь → нейросеть). priority: 0 — нужен сейчас. */
-function requestInstrumental(track, priority = 5) {
-  const cached = cacheGet(track.key);
-  if (cached) return Promise.resolve(cached);
-  const bad = SEP.bad.get(track.key);
+  const bad = PREP.bad.get(track.key);
   if (bad && now() - bad < 3600e3) return Promise.reject(new Error('превью трека недоступно'));
-  if (SEP.broken) return Promise.reject(new Error(SEP.broken));
-  let job = SEP.jobs.get(track.key);
+  if (PREP.broken) return Promise.reject(new Error(PREP.broken));
+  let job = PREP.jobs.get(track.key);
   if (job) { if (priority < job.priority) job.priority = priority; return job.promise; }
-  job = { key: track.key, track, priority, seq: ++SEP.seq, started: 0 };
+  job = { key: track.key, track, priority, seq: ++PREP.seq };
   job.promise = new Promise((res, rej) => { job.resolve = res; job.reject = rej; });
-  job.promise.then(
-    () => SEP.jobs.delete(track.key),
-    (err) => { SEP.jobs.delete(track.key); if (err.stage === 'download') SEP.bad.set(track.key, now()); },
-  );
-  SEP.jobs.set(track.key, job); SEP.queue.push(job); pump();
+  job.promise.then(() => PREP.jobs.delete(track.key), () => { PREP.jobs.delete(track.key); PREP.bad.set(track.key, now()); });
+  PREP.jobs.set(track.key, job); PREP.queue.push(job); pumpPrep();
   return job.promise;
 }
 
-const safeKey = (k) => k.replace(/[^a-z0-9_-]/gi, '_');
-
-async function processJob(worker, job) {
-  const t = job.track; const started = now();
-  const base = path.join(DIRS.tmp, `${safeKey(t.key)}_${crypto.randomBytes(3).toString('hex')}`);
-  const raw = `${base}.src`; const wav = `${base}.${worker.inExt || 'wav'}`; const inst = `${base}_inst.${worker.outExt || 'wav'}`;
-  const out = path.join(DIRS.cache, `${safeKey(t.key)}.mp3`);
-  let stage = 'download';
-  try {
-    await downloadPreview(t, raw);
-    stage = 'convert'; // в нейросеть идёт только окно SEP_WINDOW сек — быстрее на CPU
-    const total = (await probeDuration(raw)) || 30;
-    const win = Math.min(total, CFG.sepWindow);
-    const off = Math.max(0, Math.random() * (total - win));
-    await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-ss', off.toFixed(2), '-t', win.toFixed(2), '-i', raw, '-vn', '-ac', '2', '-ar', '44100', wav]);
-    stage = 'separate';
-    await worker.separate(wav, inst);
-    stage = 'encode';
-    await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', inst, '-c:a', 'libmp3lame', '-b:a', '256k', '-map_metadata', '-1', out]);
-    const { size } = await fsp.stat(out);
-    Q.cachePut.run({ key: t.key, path: out, model: SEP.model, bytes: size, now: now() });
-    SEP.done++; SEP.sepFails = 0; SEP.totalSec += (now() - started) / 1000;
-    log.info(`separated «${t.title}» in ${((now() - started) / 1000).toFixed(1)}s · ${SEP.model}`);
-    return out;
-  } catch (err) {
-    SEP.failed++; err.stage = stage;
-    log.warn(`separate ${t.key} «${t.title}» [${stage}]: ${err.message}`);
-    const restart = err.crash && !err.oom; // воркер перезапускался — задача вернётся в очередь
-    if (!err.oom && !restart) sepError(stage, t, err.message);
-    if (stage === 'separate' && !restart) onSeparationFailure(err);
-    throw err;
-  } finally {
-    for (const f of [raw, wav, inst]) fs.rm(f, { force: true }, () => {});
+function pumpPrep() {
+  while (PREP.active < CFG.prepConcurrency && PREP.queue.length) {
+    PREP.queue.sort((a, b) => a.priority - b.priority || a.seq - b.seq);
+    const job = PREP.queue.shift();
+    PREP.active++;
+    buildLevels(job.track)
+      .then(() => job.resolve({ track: job.track, levels: LEVELS.map((_, i) => ({ fileId: null, path: clipPath(job.track.key, i) })) }), job.reject)
+      .finally(() => { PREP.active--; setImmediate(pumpPrep); });
   }
 }
 
+async function buildLevels(t) {
+  const started = now();
+  const src = path.join(DIRS.tmp, `${safeKey(t.key)}_${crypto.randomBytes(3).toString('hex')}.src`);
+  const dir = clipDir(t.key);
+  let stage = 'download';
+  try {
+    await downloadPreview(t, src);
+    stage = 'cut';
+    await fsp.mkdir(dir, { recursive: true });
+    await cutLevels(src, dir);
+    const bytes = LEVELS.reduce((s, _, i) => s + fs.statSync(clipPath(t.key, i)).size, 0);
+    Q.filesPut.run({ key: t.key, bytes, now: now() });
+    PREP.done++; PREP.totalMs += now() - started;
+    log.debug(`levels «${t.title}» in ${now() - started}ms`);
+  } catch (err) {
+    PREP.failed++; err.stage = stage;
+    log.warn(`prepare ${t.key} «${t.title}» [${stage}]: ${err.message}`);
+    prepError(stage, t, err.message);
+    fs.rm(dir, { recursive: true, force: true }, () => {});
+    throw err;
+  } finally {
+    fs.rm(src, { force: true }, () => {});
+  }
+}
+
+/** Один проход ffmpeg → 4 файла. Тишину/фейд в начале и конце превью пропускаем. */
+function cutLevels(src, dir) {
+  const fmt = 'aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo';
+  const trim = 'silenceremove=start_periods=1:start_threshold=-30dB';
+  const graph = [
+    `[0:a]${fmt},${trim},asplit=5[a][b][c][d][e]`,
+    '[a]atrim=0:1,asetpts=N/SR/TB,afade=t=out:st=0.85:d=0.15[s]',
+    `[b]areverse,${trim},atrim=0:1,areverse,asetpts=N/SR/TB,afade=t=in:d=0.15[t]`,
+    `aevalsrc=0:s=44100:d=0.45,${fmt}[g]`,
+    '[s][g][t]concat=n=3:v=0:a=1[l0]',
+    ...LEVELS.slice(1).map((L, k) => `[${'cde'[k]}]atrim=0:${L.dur},asetpts=N/SR/TB,afade=t=out:st=${(L.dur - 0.3).toFixed(2)}:d=0.3[l${k + 1}]`),
+  ].join(';');
+  const outs = LEVELS.flatMap((_, i) => ['-map', `[l${i}]`, '-c:a', 'libmp3lame', '-b:a', '128k', '-map_metadata', '-1', '-id3v2_version', '0', path.join(dir, `l${i}.mp3`)]);
+  return run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', src, '-filter_complex', graph, ...outs], { timeout: 30e3 });
+}
+
 async function fetchAudio(url, dst) {
-  const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 noliric-bot' }, signal: AbortSignal.timeout(30e3) });
+  const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 noliric-bot' }, signal: AbortSignal.timeout(20e3) });
   if (!res.ok) throw new Error(`превью HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   if (buf.length < 20_000) throw new Error('превью пустое');
@@ -1087,28 +704,22 @@ async function downloadPreview(t, dst) {
   throw new Error(errors.join(' · '));
 }
 
-function cacheGet(key) {
-  const row = Q.cacheGet.get(key);
-  if (!row) return null;
-  if (!fs.existsSync(row.path)) { Q.cacheDel.run(key); return null; }
-  Q.cacheTouch.run(now(), key);
-  return row.path;
-}
-
 function cleanCache() {
   const max = CFG.cacheMaxMb * 1048576;
-  let { bytes } = Q.cacheStats.get();
+  let { bytes } = Q.filesStats.get();
   if (bytes <= max) return;
-  for (const r of Q.cacheLru.all()) {
+  const busy = new Set(PREP.jobs.keys());
+  for (const r of Q.filesLru.all()) {
     if (bytes <= max * 0.9) break;
-    fs.rmSync(r.path, { force: true }); Q.cacheDel.run(r.track_key); bytes -= r.bytes;
+    if (busy.has(r.track_key)) continue;
+    fs.rmSync(clipDir(r.track_key), { recursive: true, force: true }); Q.filesDel.run(r.track_key); bytes -= r.bytes;
   }
   log.info(`cache trimmed to ${(bytes / 1048576).toFixed(0)} MB`);
 }
 
 /* ═══════════════════════════ ffmpeg ═══════════════════════════ */
 
-function run(cmd, args, { timeout = 120e3 } = {}) {
+function run(cmd, args, { timeout = 60e3 } = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = ''; let err = '';
@@ -1120,46 +731,24 @@ function run(cmd, args, { timeout = 120e3 } = {}) {
   });
 }
 
-async function probeDuration(file) {
-  try {
-    const out = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], { timeout: 15e3 });
-    const d = parseFloat(out);
-    return Number.isFinite(d) ? d : 0;
-  } catch { return 0; }
-}
-
-/** Случайный фрагмент `seconds` сек из инструментала: фейды, без тегов. */
-async function makeClip(src, seconds) {
-  const total = (await probeDuration(src)) || 30;
-  const dur = Math.max(5, Math.min(seconds, total - 0.5));
-  const start = Math.random() * Math.max(0, total - dur - 0.3);
-  const out = path.join(DIRS.tmp, `clip_${crypto.randomUUID()}.mp3`);
-  await run('ffmpeg', [
-    '-hide_banner', '-loglevel', 'error', '-y', '-ss', start.toFixed(2), '-t', dur.toFixed(2), '-i', src,
-    '-af', `afade=t=in:st=0:d=0.35,afade=t=out:st=${(dur - 0.6).toFixed(2)}:d=0.6`,
-    '-ac', '2', '-ar', '44100', '-c:a', 'libmp3lame', '-b:a', '192k', '-map_metadata', '-1', '-id3v2_version', '0', out,
-  ]);
-  return { path: out, duration: Math.round(dur) };
-}
-
 /* ═══════════════════════════ режимы и игра ═══════════════════════════ */
 
 const MODES = {
   artist: {
     key: 'artist', title: 'Artist Vol.', desc: 'треки из всей дискографии', source: ['artist'],
-    clip: [15, 20], answer: 'poll', hint: true, base: 100, prompt: 'Отправь имя исполнителя — например, <i>Kai Angel</i>',
+    answer: 'poll', hint: true, mult: 1, maxLevel: 3, prompt: 'Отправь имя исполнителя — например, <i>Kai Angel</i>',
   },
   album: {
     key: 'album', title: 'Album Vol.', desc: 'песни одного альбома', source: ['album'],
-    clip: [15, 20], answer: 'poll', hint: true, base: 100, prompt: 'Отправь название альбома — например, <i>Shh!</i>',
+    answer: 'poll', hint: true, mult: 1, maxLevel: 3, prompt: 'Отправь название альбома — например, <i>Shh!</i>',
   },
   hardcore: {
-    key: 'hardcore', title: 'Hardcore Vol.', desc: '10 сек, название пишешь сам, без подсказок', source: ['artist', 'album'],
-    clip: [10, 10], answer: 'text', hint: false, base: 200, prompt: 'Отправь исполнителя или альбом',
+    key: 'hardcore', title: 'Hardcore Vol.', desc: 'максимум 3 сек, название пишешь сам, ×2 очки', source: ['artist', 'album'],
+    answer: 'text', hint: false, mult: 2, maxLevel: 1, prompt: 'Отправь исполнителя или альбом',
   },
   challenge: {
     key: 'challenge', title: 'Challenge Vol.', desc: 'подряд до первой ошибки', source: ['artist', 'album'],
-    clip: [12, 15], answer: 'poll', hint: false, base: 100, endless: true, prompt: 'Отправь исполнителя или альбом',
+    answer: 'poll', hint: false, mult: 1, maxLevel: 3, endless: true, prompt: 'Отправь исполнителя или альбом',
   },
 };
 
@@ -1188,13 +777,15 @@ function hintText(g) {
   return cut(lines.join('\n'), 190);
 }
 
+const ptsWord = (n) => (n % 10 === 1 && n % 100 !== 11 ? 'очко' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'очка' : 'очков');
+
 class Game {
   constructor({ uid, chatId, mode, item, pool, rounds, cardId }) {
     Object.assign(this, {
       uid, chatId, item, pool, cardId, mode: MODES[mode],
       queue: shuffle(pool.tracks.slice()), wanted: MODES[mode].endless ? Infinity : rounds,
       score: 0, correct: 0, wrong: 0, streak: 0, bestStreak: 0, misses: 0, failRow: 0,
-      history: [], i: 0, cur: null, stopped: false, reason: null, noDraft: false, waiter: null,
+      history: [], i: 0, cur: null, stopped: false, reason: null, waiter: null,
     });
     this.performer = pool.artist || pool.name;
     this.title = pool.type === 'album' && pool.artist ? `${pool.name} — ${pool.artist}` : pool.name;
@@ -1208,9 +799,9 @@ class Game {
   header(final = false) {
     const m = this.mode;
     const top = `${e(m.key)} <b>${m.title}</b> · ${esc(this.title)}`;
-    if (final) return `${top}\nИгра завершена · <b>${fmt(this.score)}</b> очков`;
-    if (m.endless) return `${top}\nСерия <b>${this.streak}</b> · ${fmt(this.score)} очков`;
-    return `${top}\nРаунд ${Math.min(this.i + 1, this.total)}/${this.total} · <b>${fmt(this.score)}</b> очков${this.streak > 1 ? ` · серия ${this.streak}` : ''}`;
+    if (final) return `${top}\nИгра завершена · <b>${fmt(this.score)}</b> ${ptsWord(this.score)}`;
+    if (m.endless) return `${top}\nСерия <b>${this.streak}</b> · ${fmt(this.score)} ${ptsWord(this.score)}`;
+    return `${top}\nРаунд ${Math.min(this.i + 1, this.total)}/${this.total} · <b>${fmt(this.score)}</b> ${ptsWord(this.score)}${this.streak > 1 ? ` · серия ${this.streak}` : ''}`;
   }
 
   async updateCard(final = false) {
@@ -1226,15 +817,15 @@ class Game {
     try {
       await this.updateCard();
       while (!this.stopped && this.i < this.total) {
-        const clip = await this.nextClip();
-        if (!clip || this.stopped) { if (clip) fs.rm(clip.path, { force: true }, () => {}); break; }
+        const prep = await this.nextTrack();
+        if (!prep || this.stopped) break;
         await this.updateCard();
-        const res = await this.playRound(clip);
+        const res = await this.playRound(prep);
         if (this.stopped || res.stopped) break;
         this.i++;
         if (this.mode.endless && !res.correct) { this.reason = 'miss'; break; }
         if (res.timeout) { if (++this.misses >= 2) { this.reason = 'afk'; break; } } else this.misses = 0;
-        await sleep(1300);
+        await sleep(1200);
       }
       if (!this.reason) this.reason = this.stopped ? 'stop' : this.mode.endless ? 'cleared' : 'done';
     } catch (err) {
@@ -1247,111 +838,150 @@ class Game {
     }
   }
 
-  async nextClip() {
+  async nextTrack() {
     while (!this.stopped && this.i < this.total) {
       const track = this.queue[this.i];
-      const want = requestInstrumental(track, 0);
+      const want = prepareTrack(track, 0);
       for (let k = 1; k <= CFG.prefetch; k++) {
         const nt = this.queue[this.i + k];
-        if (nt && this.i + k < this.total) requestInstrumental(nt, k).catch(() => {});
+        if (nt && this.i + k < this.total) prepareTrack(nt, k).catch(() => {});
       }
       try {
-        const file = await this.waitWithStatus(want);
-        if (!file || this.stopped) return null;
-        const [a, b] = this.mode.clip;
-        const clipInfo = await makeClip(file, a + crypto.randomInt(b - a + 1));
-        this.failRow = 0;
-        return { track, ...clipInfo };
+        const prep = await this.waitReady(want);
+        if (prep) this.failRow = 0;
+        return prep;
       } catch (err) {
-        if (SEP.broken) throw new Error(`отделение вокала недоступно: ${SEP.broken}`);
+        if (PREP.broken) throw new Error(PREP.broken);
         log.warn(`game ${this.id}: skip ${track.key} — ${err.message}`);
         this.queue.splice(this.i, 1);
-        this.lastError = err.message;
-        if (++this.failRow >= 3) throw new Error(`3 трека подряд не обработались. Причина: ${cut(err.message, 160)}`);
+        if (++this.failRow >= 3) throw new Error(`3 трека подряд не загрузились. Причина: ${cut(err.message, 160)}`);
       }
     }
     return null;
   }
 
-  /** Ждёт инструментал; если долго — анимированный черновик (sendMessageDraft) с прогрессом. */
-  async waitWithStatus(promise) {
-    const quick = await Promise.race([promise.then(() => true, () => true), sleep(800).then(() => false)]);
+  async waitReady(promise) {
+    const quick = await Promise.race([promise.then(() => true, () => true), sleep(600).then(() => false)]);
     if (quick) return promise;
-    const key = this.queue[this.i]?.key;
-    const label = this.mode.endless ? `Трек ${this.history.length + 1} · серия ${this.streak}` : `Раунд ${this.i + 1} из ${this.total}`;
-    const draftId = crypto.randomInt(1, 2 ** 31 - 1);
-    let n = 0; let live = true; const since = now();
-    const retry = this.failRow ? ` · другой трек (${this.failRow + 1}/3)` : '';
-    const tick = async () => {
-      if (!live || this.stopped) return;
-      const status = jobStatus(key);
-      const text = `${e('loading')} <b>${status}${'.'.repeat((n++ % 3) + 1)}</b> ${mmss(now() - since)}\n<i>${label}${retry}</i>`;
-      if (!this.noDraft) {
-        try { await tg('sendMessageDraft', { chat_id: this.chatId, draft_id: draftId, text, parse_mode: 'HTML' }, { retries: 0 }); return; } catch (err) {
-          if (err.code === 400 || err.code === 404) this.noDraft = true;
-        }
-      }
-      await safe(tg('sendChatAction', { chat_id: this.chatId, action: 'record_voice' }, { retries: 0 }));
-    };
-    tick();
-    const iv = setInterval(tick, 3500);
+    const action = () => safe(tg('sendChatAction', { chat_id: this.chatId, action: 'upload_voice' }, { retries: 0 }));
+    action();
+    const iv = setInterval(action, 4500);
     let to;
-    const timeout = new Promise((_, rej) => { to = setTimeout(() => rej(new Error('обработка заняла больше 15 минут')), 15 * 60e3); });
-    try {
-      return await Promise.race([promise, timeout, this.stopP.then(() => null)]);
-    } finally { live = false; clearInterval(iv); clearTimeout(to); }
+    const timeout = new Promise((_, rej) => { to = setTimeout(() => rej(new Error('превью грузится слишком долго')), 90e3); });
+    try { return await Promise.race([promise, timeout, this.stopP.then(() => null)]); } finally { clearInterval(iv); clearTimeout(to); }
   }
 
-  async playRound(clip) {
-    const t = clip.track; const m = this.mode;
-    const tag = m.endless ? `#${this.history.length + 1}` : `${this.i + 1}/${this.total}`;
-    const stopBtn = B('Стоп', 'g:stop', 'cross');
-    let cur;
-    try {
-      if (m.answer === 'text') {
-        const deadline = Math.floor(now() / 1000) + CFG.answerSec + 1;
-        const msg = await sendAudioFile(this.chatId, clip, this.performer, {
-          caption: `<b>[${tag}]</b> Напиши название трека\n${e('clock')} <tg-time unix="${deadline}" format="r">${CFG.answerSec} сек</tg-time>`,
-          parse_mode: 'HTML', reply_markup: kbd([[B('Пропустить', 'g:skip', 'timePassed'), stopBtn]]),
-        });
-        cur = { kind: 'text', track: t, msgId: msg.message_id, at: now(), deadline: deadline * 1000, hint: false, done: false };
-      } else {
-        await sendAudioFile(this.chatId, clip, this.performer);
-        const { options, correct } = buildOptions(t, this.pool);
-        const album = t.album || this.pool.name;
-        const poll = await sendQuiz(this.chatId, {
-          question: `[${tag}] К какому треку относится этот инструментал?`, options, correct,
-          explanation: `<b>${esc(cut(t.title, 80))}</b> · ${esc(cut(album, 70))}${t.year ? ` · ${t.year}` : ''}`,
-          rows: [m.hint ? [B('Подсказка', 'g:hint', 'eye'), stopBtn] : [stopBtn]],
-        });
-        cur = { kind: 'poll', track: t, msgId: poll.message_id, pollId: poll.poll.id, correct, options, at: now(), deadline: now() + CFG.answerSec * 1000, hint: false, done: false };
-        pollIndex.set(cur.pollId, this);
+  caption(cur) {
+    const L = LEVELS[cur.level];
+    const pts = Math.round(L.pts * this.mode.mult * (cur.hint ? 0.5 : 1));
+    let c = `<b>[${cur.tag}]</b> ${L.caption} · ${pts ? `${pts} ${ptsWord(pts)}` : 'без очков'}`;
+    if (cur.kind === 'text') c += `\nНапиши название · ${e('clock')} <tg-time unix="${Math.floor(cur.deadline / 1000)}" format="r">${CFG.answerSec} сек</tg-time>`;
+    return c;
+  }
+
+  rows(cur) {
+    const row = [];
+    if (cur.level < this.mode.maxLevel) row.push(B(LEVELS[cur.level + 1].label, 'g:more', 'clock'));
+    if (cur.kind === 'poll' && this.mode.hint) row.push(B('Подсказка', 'g:hint', 'eye'));
+    if (cur.kind === 'text') row.push(B('Пропустить', 'g:skip', 'timePassed'));
+    row.push(B('Стоп', 'g:stop', 'cross'));
+    return [row];
+  }
+
+  /** Отправка/замена аудио уровня: по file_id мгновенно, иначе загрузка файла (file_id запоминается). */
+  async sendLevel(cur, { edit = false } = {}) {
+    const lv = cur.prep.levels[cur.level];
+    const key = cur.track.key;
+    const extra = { caption: this.caption(cur), parse_mode: 'HTML' };
+    const withKb = cur.kind === 'text' ? { reply_markup: kbd(this.rows(cur)) } : {};
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!lv.fileId && !fs.existsSync(lv.path)) await buildLevels(cur.track); // file_id протух, файлов нет — пересобрать
+      const ref = lv.fileId || 'attach://clip';
+      const files = lv.fileId ? undefined : { clip: { blob: await fs.openAsBlob(lv.path, { type: 'audio/mpeg' }), name: 'noliric.mp3' } };
+      try {
+        let msg;
+        if (edit) {
+          msg = await tg('editMessageMedia', {
+            chat_id: this.chatId, message_id: cur.audioId,
+            media: { type: 'audio', media: ref, performer: cut(this.performer, 60), title: '???', ...extra }, ...withKb,
+          }, { files });
+        } else {
+          msg = await tg('sendAudio', { chat_id: this.chatId, audio: ref, performer: cut(this.performer, 60), title: '???', ...extra, ...withKb }, { files });
+        }
+        const fid = msg?.audio?.file_id;
+        if (fid && !lv.fileId) { lv.fileId = fid; Q.clipPut.run(key, cur.level, fid, now()); }
+        return msg;
+      } catch (err) {
+        if (lv.fileId && err.code === 400 && !/not modified/i.test(err.message) && attempt === 0) { Q.clipDel.run(key); lv.fileId = null; continue; }
+        throw err;
       }
-    } finally {
-      fs.rm(clip.path, { force: true }, () => {});
     }
+    return null;
+  }
+
+  async levelUp() {
+    const cur = this.cur;
+    if (!cur || cur.done || cur.busy || cur.level >= this.mode.maxLevel) return false;
+    cur.busy = true; cur.level++;
+    try {
+      await this.sendLevel(cur, { edit: true });
+      if (cur.kind === 'poll') await safe(tg('editMessageReplyMarkup', { chat_id: this.chatId, message_id: cur.pollMsgId, reply_markup: kbd(this.rows(cur)) }));
+      return true;
+    } catch (err) {
+      cur.level--; log.warn(`levelUp: ${err.message}`); return false;
+    } finally { cur.busy = false; }
+  }
+
+  async playRound(prep) {
+    const t = prep.track; const m = this.mode;
+    const cur = {
+      kind: m.answer, track: t, prep, level: 0, hint: false, done: false, busy: false,
+      tag: m.endless ? `#${this.history.length + 1}` : `${this.i + 1}/${this.total}`,
+      at: now(), deadline: now() + CFG.answerSec * 1000 + 1000,
+    };
     this.cur = cur;
+    const audio = await this.sendLevel(cur);
+    cur.audioId = audio.message_id;
+    if (cur.kind === 'poll') {
+      const { options, correct } = buildOptions(t, this.pool);
+      const album = t.album || this.pool.name;
+      const poll = await sendQuiz(this.chatId, {
+        question: `[${cur.tag}] Что это за трек?`, options, correct,
+        explanation: `<b>${esc(cut(t.title, 80))}</b> · ${esc(cut(album, 70))}${t.year ? ` · ${t.year}` : ''}`,
+        rows: this.rows(cur),
+      });
+      Object.assign(cur, { pollId: poll.poll.id, pollMsgId: poll.message_id, correct, options, at: now(), deadline: now() + CFG.answerSec * 1000 });
+      pollIndex.set(cur.pollId, this);
+    }
 
     const ans = await this.waitAnswer(cur.deadline - now() + 1500);
     cur.done = true;
     if (cur.pollId) pollIndex.delete(cur.pollId);
-    const stripKb = () => safe(tg('editMessageReplyMarkup', { chat_id: this.chatId, message_id: cur.msgId, reply_markup: kbd([]) }));
+    const kbMsg = cur.kind === 'poll' ? cur.pollMsgId : cur.audioId;
+    const stripKb = () => safe(tg('editMessageReplyMarkup', { chat_id: this.chatId, message_id: kbMsg, reply_markup: kbd([]) }));
     if (ans.type === 'stop') { await stripKb(); return { stopped: true }; }
 
     let ok = false; let answer = null;
     if (ans.type === 'answer') { ok = ans.option === cur.correct; answer = cur.options[ans.option] ?? null; }
     if (ans.type === 'text') { ok = checkAnswer(ans.text, t); answer = cut(ans.text, 120); }
-    const ms = ans.at ? ans.at - cur.at : null;
-    const pts = ok ? this.points(ms, cur.hint) : 0;
-    if (ok) { this.correct++; this.streak++; this.bestStreak = Math.max(this.bestStreak, this.streak); } else { this.wrong++; this.streak = 0; }
+    const L = LEVELS[cur.level];
+    let pts = 0;
+    if (ok) {
+      pts = L.pts * m.mult;
+      if (m.endless && pts) pts += 10 * this.streak;
+      if (cur.hint) pts *= 0.5;
+      pts = Math.round(pts);
+      this.correct++; this.streak++; this.bestStreak = Math.max(this.bestStreak, this.streak);
+    } else { this.wrong++; this.streak = 0; }
     this.score += pts;
-    this.history.push({ title: t.title, ok, pts, type: ans.type });
-    Q.roundAdd.run({ game: this.id, idx: this.history.length, key: t.key, title: t.title, answer, correct: ok ? 1 : 0, points: pts, hint: cur.hint ? 1 : 0, ms, now: now() });
+    const ms = ans.at ? ans.at - cur.at : null;
+    this.history.push({ title: t.title, ok, pts, level: cur.level, type: ans.type });
+    Q.roundAdd.run({ game: this.id, idx: this.history.length, key: t.key, title: t.title, answer, correct: ok ? 1 : 0, points: pts, hint: cur.hint ? 1 : 0, level: cur.level, ms, now: now() });
 
     if (cur.kind === 'text') {
-      await safe(tg('editMessageCaption', { chat_id: this.chatId, message_id: cur.msgId, caption: `<b>[${tag}]</b> ${esc(t.title)}`, parse_mode: 'HTML', reply_markup: kbd([]) }));
+      await safe(tg('editMessageCaption', { chat_id: this.chatId, message_id: cur.audioId, caption: `<b>[${cur.tag}]</b> ${esc(t.title)}`, parse_mode: 'HTML', reply_markup: kbd([]) }));
       const name = `<b>${esc(t.title)}</b>`;
-      const line = ok ? `${e('check')} ${name} · +${pts}`
+      const line = ok ? `${e('check')} ${name} · ${L.label} · +${pts}`
         : ans.type === 'timeout' ? `${e('clock')} Время вышло — это ${name}`
           : ans.type === 'skip' ? `${e('timePassed')} Пропуск — это ${name}`
             : `${e('cross')} Мимо — это ${name}`;
@@ -1360,12 +990,6 @@ class Game {
       await stripKb();
     }
     return { correct: ok, timeout: ans.type === 'timeout' };
-  }
-
-  points(ms, hint) {
-    const speed = ms == null ? 0 : Math.max(0, Math.min(1, 1 - ms / (CFG.answerSec * 1000)));
-    const base = this.mode.base + (this.mode.endless ? 15 * this.streak : 0);
-    return Math.round(base * (0.4 + 0.6 * speed) * (hint ? 0.5 : 1));
   }
 
   waitAnswer(ms) {
@@ -1400,7 +1024,7 @@ class Game {
     if (!played) {
       const text = this.reason === 'stop'
         ? `${e('info')} Игра остановлена`
-        : `${e('cross')} <b>Игра прервана</b>\n${esc(cut(this.error || 'не удалось подготовить треки — попробуй другой запрос', 200))}`;
+        : `${e('cross')} <b>Игра прервана</b>\n${esc(cut(this.error || 'не удалось загрузить треки — попробуй другой запрос', 200))}`;
       await safe(send(this.chatId, text, [[B('Ещё раз', 'g:again', 'party'), B('Меню', 'm:new', 'home')]]));
       return;
     }
@@ -1418,8 +1042,8 @@ async function sendSummary(g, record) {
   const m = g.mode; const played = g.history.length;
   const reason = REASONS[g.reason] || REASONS.done;
   const stat = m.endless
-    ? `Серия <b>${g.bestStreak}</b> · ${fmt(g.score)} очков`
-    : `<b>${fmt(g.score)}</b> очков · ${g.correct}/${played} · серия ${g.bestStreak}`;
+    ? `Серия <b>${g.bestStreak}</b> · ${fmt(g.score)} ${ptsWord(g.score)}`
+    : `<b>${fmt(g.score)}</b> ${ptsWord(g.score)} · ${g.correct}/${played} · серия ${g.bestStreak}`;
   const rows = [[B('Ещё раз', 'g:again', 'party', 'success'), B('Меню', 'm:new', 'home')]];
   const list = g.history.slice(0, 40);
 
@@ -1430,8 +1054,8 @@ async function sendSummary(g, record) {
       `<p>${stat}</p>`,
       record ? `<p>${e('party')} <b>Новый рекорд</b></p>` : '',
       '<table>',
-      '<tr><td><b>#</b></td><td><b>Трек</b></td><td><b>Очки</b></td></tr>',
-      ...list.map((h, i) => `<tr><td>${i + 1}</td><td>${h.ok ? '✓' : '✗'} ${esc(cut(h.title, 60))}</td><td>${h.ok ? `+${h.pts}` : '—'}</td></tr>`),
+      '<tr><td><b>#</b></td><td><b>Трек</b></td><td><b>Фрагмент</b></td><td><b>Очки</b></td></tr>',
+      ...list.map((h, i) => `<tr><td>${i + 1}</td><td>${h.ok ? '✓' : '✗'} ${esc(cut(h.title, 50))}</td><td>${LEVELS[h.level].label}</td><td>${h.ok ? `+${h.pts}` : '—'}</td></tr>`),
       '</table>',
     ].join('');
     try {
@@ -1440,7 +1064,7 @@ async function sendSummary(g, record) {
       if (err.code === 400 || err.code === 404) { CFG.rich = false; log.warn(`rich messages off: ${err.message}`); }
     }
   }
-  const lines = list.map((h, i) => `${i + 1}. ${h.ok ? '✓' : '✗'} ${esc(cut(h.title, 50))}${h.ok ? ` · +${h.pts}` : ''}`).join('\n');
+  const lines = list.map((h, i) => `${i + 1}. ${h.ok ? '✓' : '✗'} ${esc(cut(h.title, 45))} · ${LEVELS[h.level].label}${h.ok ? ` · +${h.pts}` : ''}`).join('\n');
   const text = `${e('logo')} <b>${reason}</b>\n${e(m.key)} ${m.title} · ${esc(g.title)}\n\n${stat}${record ? `\n${e('party')} <b>Новый рекорд</b>` : ''}\n\n<blockquote expandable>${lines}</blockquote>`;
   return send(g.chatId, text, rows);
 }
@@ -1452,7 +1076,7 @@ const state = (uid) => { let s = STATE.get(uid); if (!s) STATE.set(uid, (s = { s
 
 function homeScreen(uid) {
   const u = Q.user.get(uid) || {};
-  const text = `${e('logo')} <b>noliric</b>\n\nУгадай трек по инструменталу — вокал вырезан нейросетью, остался только бит.\nНапиши исполнителя или альбом — или выбери режим.\n\n<blockquote>${fmt(u.score)} очков · рекорд серии ${u.best_streak || 0}</blockquote>`;
+  const text = `${e('logo')} <b>noliric</b>\n\nУгадай трек по одной секунде. Не узнал — открой 3, 5 или 10 сек, но очков станет меньше.\nНапиши исполнителя или альбом — или выбери режим.\n\n<blockquote>${fmt(u.score)} очков · рекорд серии ${u.best_streak || 0}</blockquote>`;
   const rows = [
     [B('Играть', 'm:play', 'send', 'primary')],
     [B('Профиль', 'm:profile', 'profile'), B('Топ', 'm:top', 'stats')],
@@ -1520,7 +1144,7 @@ function topScreen(uid, kind = 'score') {
 function helpScreen() {
   const modes = Object.values(MODES).map((m) => `${e(m.key)} <b>${m.title}</b> — ${m.desc}`).join('\n');
   return {
-    text: `${e('info')} <b>Как играть</b>\n\nБот берёт случайный трек, вырезает вокал нейросетью и присылает кусок инструментала на 10–20 сек. Угадай название — на ответ ${CFG.answerSec} сек.\n\n${modes}\n\nЧем быстрее ответ, тем больше очков. Подсказка режет очки вдвое, в Hardcore — ×2 за раунд.`,
+    text: `${e('info')} <b>Как играть</b>\n\nБот присылает 1 секунду начала и конца трека. Не узнал — жми «3 сек», «5 сек» или «10 сек». На ответ ${CFG.answerSec} сек.\n\n<blockquote>${LEVELS.map((L) => `${L.label} — ${L.pts ? `${L.pts} ${ptsWord(L.pts)}` : 'без очков'}`).join('\n')}</blockquote>\n\n${modes}\n\nПодсказка режет очки вдвое, в Hardcore очки ×2.`,
     rows: [[B('Играть', 'm:play', 'send', 'primary')], [BACK('m:home')]],
   };
 }
@@ -1538,7 +1162,7 @@ async function startGame({ uid, chatId, cardId, mode, item, rounds }) {
   const m = MODES[mode];
   if (games.has(uid)) { const s = busyScreen(games.get(uid)); return card(chatId, cardId, s.text, s.rows); }
   if (games.size >= CFG.maxGames) return card(chatId, cardId, `${e('clock')} Сейчас много игр — попробуй через минуту.`, [[BACK('m:home')]]);
-  if (SEP.broken) return card(chatId, cardId, `${e('cross')} Нейросеть временно недоступна. Попробуй позже.`, [[BACK('m:home')]]);
+  if (PREP.broken) return card(chatId, cardId, `${e('cross')} Бот временно не может резать фрагменты. Попробуй позже.`, [[BACK('m:home')]]);
 
   cardId = await card(chatId, cardId, `${e('loading')} <b>Собираю треки</b> · ${esc(itemName(item))}`, []);
   let pool;
@@ -1667,9 +1291,19 @@ async function onCallback(cq) {
         if (!g) { await ack('Игра уже закончилась'); safe(tg('editMessageReplyMarkup', { chat_id: chatId, message_id: msgId, reply_markup: kbd([]) })); return; }
         if (b === 'stop') { g.stop('stop'); await ack('Игра остановлена'); return; }
         if (b === 'hint') {
-          if (!g.mode.hint || g.cur?.kind !== 'poll' || g.cur.done || g.cur.msgId !== msgId) { await ack(); return; }
-          if (g.cur.hint) { await ack(hintText(g), true); return; }
-          g.cur.hint = true; await ack(hintText(g), true); return;
+          const cur = g.cur;
+          if (!g.mode.hint || cur?.kind !== 'poll' || cur.done || cur.pollMsgId !== msgId) { await ack(); return; }
+          if (cur.hint) { await ack(hintText(g), true); return; }
+          cur.hint = true; await ack(hintText(g), true);
+          await safe(tg('editMessageCaption', { chat_id: chatId, message_id: cur.audioId, caption: g.caption(cur), parse_mode: 'HTML' }));
+          return;
+        }
+        if (b === 'more') {
+          const cur = g.cur;
+          if (!cur || cur.done || cur.busy || cur.level >= g.mode.maxLevel) { await ack(); return; }
+          await ack(`Открываю ${LEVELS[cur.level + 1].label}`);
+          await g.levelUp();
+          return;
         }
         if (b === 'skip') {
           if (g.cur?.kind === 'text' && !g.cur.done) g.answer({ type: 'skip', at: now() });
@@ -1697,21 +1331,18 @@ function onPollAnswer(pa) {
 /* ═══════════════════════════ админка ═══════════════════════════ */
 
 function adminScreen() {
-  const s = Q.stats.get({ day: now() - 86400e3 }); const c = Q.cacheStats.get();
-  const alive = SEP.workers.filter((w) => w.alive).length;
-  const avg = SEP.done ? ` · ~${(SEP.totalSec / SEP.done).toFixed(1)} с/трек` : '';
+  const s = Q.stats.get({ day: now() - 86400e3 }); const f = Q.filesStats.get(); const ids = Q.clipStats.get();
+  const avg = PREP.done ? ` · ~${Math.round(PREP.totalMs / PREP.done)} мс/трек` : '';
   return {
     text: [
       `${e('settings')} <b>Админ-панель</b>`, '',
       `Пользователи: <b>${fmt(s.users)}</b> · за сутки ${fmt(s.users24)} · заблокировали ${fmt(s.blocked)}`,
       `Игры: <b>${fmt(s.games)}</b> · за сутки ${fmt(s.games24)} · сейчас ${games.size}`,
-      `Модель: <code>${esc(SEP.model || 'загружается')}</code>${SEP.fallback ? ' (запасная)' : ''}`,
-      SEP.account ? `MVSEP: ${SEP.account.premium ? 'premium' : 'бесплатный'}${SEP.account.credits != null ? ` · кредитов ${fmt(SEP.account.credits)}` : ''}` : null,
-      `Нейросеть: ${alive}/${SEP.workers.length} · очередь ${SEP.queue.length} · готово ${fmt(SEP.done)} · ошибок ${fmt(SEP.failed)}${avg}`,
-      ...SEP.workers.filter((w) => w.job).map((w) => `В работе: «${esc(cut(w.job.track.title, 40))}» · ${mmss(now() - w.job.started)}${w.remote?.status ? ` · ${w.remote.status}${w.remote.order ? ` #${w.remote.order}` : ''}` : ''}`),
-      SEP.broken ? `<b>Ошибка:</b> ${esc(SEP.broken)}` : null,
-      `Кэш: ${fmt(c.n)} инструм. · ${(c.bytes / 1048576).toFixed(0)} / ${fmt(CFG.cacheMaxMb)} МБ`,
-      SEP.errors.length ? `\n<b>Последние ошибки</b>\n<blockquote expandable>${SEP.errors.map((x) => `${mmss(now() - x.at)} назад · ${STAGES[x.stage] || x.stage}${x.title ? ` · «${esc(cut(x.title, 30))}»` : ''}\n${esc(x.message)}`).join('\n\n')}</blockquote>` : null,
+      `Фрагменты: готово ${fmt(PREP.done)} · ошибок ${fmt(PREP.failed)} · в работе ${PREP.active} · очередь ${PREP.queue.length}${avg}`,
+      `Кэш: ${fmt(f.n)} треков · ${(f.bytes / 1048576).toFixed(0)} / ${fmt(CFG.cacheMaxMb)} МБ · в Telegram ${fmt(ids.n)}`,
+      `Очки за уровни: ${LEVELS.map((L) => `${L.label} — ${L.pts}`).join(' · ')}`,
+      PREP.broken ? `<b>Ошибка:</b> ${esc(PREP.broken)}` : null,
+      PREP.errors.length ? `\n<b>Последние ошибки</b>\n<blockquote expandable>${PREP.errors.map((x) => `${mmss(now() - x.at)} назад · ${STAGES[x.stage] || x.stage}${x.title ? ` · «${esc(cut(x.title, 30))}»` : ''}\n${esc(x.message)}`).join('\n\n')}</blockquote>` : null,
       `Эмодзи-пак: ${PACK.loaded ? `${PACK.stickers.length} шт.` : 'не загружен'}`,
     ].filter((x) => x !== null).join('\n'),
     rows: [
@@ -1751,11 +1382,11 @@ async function onAdmin(cq, action, { chatId, msgId, st, ack, show }) {
       return;
     }
     case 'cache':
-      return show({ text: `${e('trash')} <b>Очистить кэш инструменталов?</b>\nФайлы придётся заново прогнать через нейросеть.`, rows: [[B('Очистить', 'adm:cachego', 'trash', 'danger')], [BACK('adm')]] });
+      return show({ text: `${e('trash')} <b>Очистить кэш фрагментов на диске?</b>\nУже загруженные в Telegram останутся — они отправляются по file_id.`, rows: [[B('Очистить', 'adm:cachego', 'trash', 'danger')], [BACK('adm')]] });
     case 'cachego': {
-      const busy = new Set(SEP.jobs.keys());
+      const busy = new Set(PREP.jobs.keys());
       let n = 0;
-      for (const r of Q.cacheAll.all()) { if (busy.has(r.track_key)) continue; fs.rmSync(r.path, { force: true }); Q.cacheDel.run(r.track_key); n++; }
+      for (const r of Q.filesAll.all()) { if (busy.has(r.track_key)) continue; fs.rmSync(clipDir(r.track_key), { recursive: true, force: true }); Q.filesDel.run(r.track_key); n++; }
       await ack(`Удалено: ${n}`);
       return show(adminScreen());
     }
@@ -1826,7 +1457,6 @@ async function shutdown(sig) {
   log.info(`${sig}: stopping…`);
   for (const g of games.values()) g.stop('stop');
   await sleep(1500);
-  for (const w of SEP.workers) w.stop();
   try { db?.close(); } catch { /* ok */ }
   process.exit(0);
 }
@@ -1839,7 +1469,8 @@ async function main() {
   for (const d of Object.values(DIRS)) fs.mkdirSync(d, { recursive: true });
   fs.rmSync(DIRS.tmp, { recursive: true, force: true }); fs.mkdirSync(DIRS.tmp, { recursive: true });
 
-  if (spawnSync('ffmpeg', ['-version']).error) { SEP.broken = 'ffmpeg не установлен'; log.error(SEP.broken); }
+  if (spawnSync('ffmpeg', ['-version']).error) { PREP.broken = 'ffmpeg не установлен'; log.error(PREP.broken); }
+  for (const old of ['cache', 'models', 'separator_worker.py']) fs.rmSync(path.join(DATA_DIR, old), { recursive: true, force: true }); // от версии с нейросетью
   initDb();
   Q.abortStale.run(now());
 
@@ -1857,14 +1488,13 @@ async function main() {
     ],
   }));
   await loadEmojiPack();
-  if (!SEP.broken) startSeparator();
   cleanCache();
   setInterval(() => { try { cleanCache(); } catch (err) { log.warn(`cache: ${err.message}`); } }, 30 * 60e3).unref();
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('unhandledRejection', (err) => log.error('unhandled:', err?.stack || err));
-  log.info(`polling · источник: ${ORDER.map((p) => p.src).join(' → ')} · модель: ${CFG.sepModel}`);
+  log.info(`polling · источник: ${ORDER.map((p) => p.src).join(' → ')} · очки: ${LEVELS.map((L) => L.pts).join('/')}`);
   await pollLoop();
 }
 
@@ -1872,8 +1502,8 @@ if (require.main === module) {
   main().catch((err) => { log.error(err.stack || err.message); process.exit(1); });
 } else {
   module.exports = {
-    canon, baseTitle, checkAnswer, buildOptions, translit, similar, makeClip, initDb, SCHEMA, WORKER_PY, CFG, DIRS, MODES, SEP,
+    canon, baseTitle, checkAnswer, buildOptions, translit, similar, initDb, SCHEMA, CFG, DIRS, MODES, PREP, LEVELS, cutLevels,
     Game, games, pollIndex, onPollAnswer, homeScreen, modesScreen, profileScreen, topScreen, helpScreen, adminScreen, roundsScreen,
-    resultsScreen, promptScreen, hintText, startSeparator, requestInstrumental, get Q() { return Q; },
+    resultsScreen, promptScreen, hintText, prepareTrack, get Q() { return Q; },
   };
 }

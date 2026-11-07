@@ -6,7 +6,7 @@ BOT_USERNAME=noliricapp
 # ─── База и файлы ───
 # В Docker DATA_DIR=/app/data задан в образе — здесь не переопределяй.
 # DB_PATH=./data/noliric.db
-CACHE_MAX_MB=3072
+CACHE_MAX_MB=1024
 
 # ─── Музыка: auto (Deezer → iTunes) | deezer | itunes ───
 MUSIC_SOURCE=auto
@@ -19,29 +19,11 @@ MAX_ACTIVE_GAMES=25
 PREFETCH=2
 RICH_MESSAGES=1
 
-# ─── Отделение вокала ───
-# local — нейросеть на своём CPU (модель уже в образе) | mvsep — облако mvsep.com
-SEP_ENGINE=local
-SEP_TIMEOUT=420
-# сколько секунд превью отправлять на обработку (12–30)
-SEP_WINDOW=22
-
-# MVSEP: токен — mvsep.com → войти → профиль → API
-MVSEP_TOKEN=
-# 48 + 11 = MelBand Roformer «becruily deux»; 48 + 7 = becruily instrum
-MVSEP_SEP_TYPE=48
-MVSEP_OPT1=11
-# бесплатный аккаунт — только 1 задача одновременно; с Premium можно 3–5
-MVSEP_CONCURRENCY=1
-MVSEP_POLL_SEC=3
-
-# Локально: лёгкая MDX-Net ONNX ≈ 1 ГБ RAM; «deux» — тяжёлый Roformer, нужно 4+ ГБ RAM
-SEP_MODEL=UVR-MDX-NET-Inst_HQ_4.onnx
-SEP_FALLBACK_MODEL=UVR-MDX-NET-Inst_HQ_3.onnx
-SEP_WORKERS=1
-SEP_THREADS=0
-SEP_OVERLAP=2
-HF_TOKEN=
+# ─── Фрагменты ───
+# очки за ответ на уровне: 1 сек (начало+конец), 3 сек, 5 сек, 10 сек
+LEVEL_POINTS=100,60,30,0
+# сколько треков резать параллельно (ffmpeg, ~0.3 сек на трек)
+PREP_CONCURRENCY=4
 
 # ─── Премиум-эмодзи ───
 EMOJI_PACK=random99_by_emsetbot
