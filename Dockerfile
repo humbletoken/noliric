@@ -1,7 +1,11 @@
-# noliric — Telegram-бот + отделение вокала (Mel-Band RoFormer, CPU)
+# noliric — Telegram-бот «угадай трек по инструменталу»
 # .env в образ не копируется: docker run --env-file .env ...
+#
+# По умолчанию вокал режет облако MVSEP (SEP_ENGINE=mvsep) — образ лёгкий, RAM почти не нужна.
+# Локальная нейросеть на своём CPU: docker build --build-arg LOCAL_SEPARATOR=1 -t noliric .
 FROM node:22-bookworm-slim
 
+ARG LOCAL_SEPARATOR=0
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -10,16 +14,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-      ffmpeg python3 python3-venv python3-dev build-essential \
-      libsndfile1 libsamplerate0 ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && if [ "$LOCAL_SEPARATOR" = "1" ]; then \
+      apt-get install -y --no-install-recommends python3 python3-venv python3-dev build-essential libsndfile1 libsamplerate0; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 
-# PyTorch (CPU-сборка) + audio-separator
-RUN python3 -m venv /opt/venv \
- && pip install --upgrade pip setuptools wheel \
- && pip install torch --index-url https://download.pytorch.org/whl/cpu \
- && pip install "audio-separator[cpu]==0.48.0"
+# PyTorch (CPU) + audio-separator — только для локального режима
+RUN if [ "$LOCAL_SEPARATOR" = "1" ]; then \
+      python3 -m venv /opt/venv \
+      && pip install --upgrade pip setuptools wheel \
+      && pip install torch --index-url https://download.pytorch.org/whl/cpu \
+      && pip install "audio-separator[cpu]==0.48.0"; \
+    fi
 
 WORKDIR /app
 COPY package.json ./

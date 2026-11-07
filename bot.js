@@ -38,10 +38,21 @@ const CFG = {
   maxGames: envInt('MAX_ACTIVE_GAMES', 25),
   prefetch: Math.max(0, envInt('PREFETCH', 2)),
   python: env('PYTHON_BIN', 'python3'),
-  sepModel: env('SEP_MODEL', 'deux'),
-  sepFallback: env('SEP_FALLBACK_MODEL', 'mel_band_roformer_instrumental_becruily.ckpt'),
+  sepModel: env('SEP_MODEL', 'UVR-MDX-NET-Inst_HQ_4.onnx'),
+  sepFallback: env('SEP_FALLBACK_MODEL', 'UVR-MDX-NET-Inst_HQ_3.onnx'),
   sepWorkers: Math.max(1, envInt('SEP_WORKERS', 1)),
   sepTimeout: Math.max(60, envInt('SEP_TIMEOUT', 420)),
+  sepWindow: Math.min(30, Math.max(12, envInt('SEP_WINDOW', 22))),
+  sepEngine: env('SEP_ENGINE', 'mvsep').toLowerCase(),
+  mvsep: {
+    token: env('MVSEP_TOKEN'),
+    host: env('MVSEP_HOST', 'https://mvsep.com').replace(/\/+$/, ''),
+    sepType: env('MVSEP_SEP_TYPE', '48'),
+    opt1: env('MVSEP_OPT1', '11'),
+    opt2: env('MVSEP_OPT2'),
+    concurrency: envInt('MVSEP_CONCURRENCY', 1),
+    poll: Math.max(2, envInt('MVSEP_POLL_SEC', 3)),
+  },
   cacheMaxMb: envInt('CACHE_MAX_MB', 3072),
   emojiPack: env('EMOJI_PACK', 'random99_by_emsetbot'),
   rich: env('RICH_MESSAGES', '1') !== '0',
@@ -642,12 +653,14 @@ def ensure_deux():
         import requests
         info = requests.get(HF + "/api/models/" + DEUX_REPO, timeout=30, headers=hf_headers()).json()
         files = [s.get("rfilename", "") for s in info.get("siblings", [])]
-        def pick(exts):
+        def pick(exact, exts):
+            if exact in files:
+                return exact
             c = [f for f in files if f.lower().endswith(exts)]
             c.sort(key=lambda f: (0 if "deux" in f.lower() else 1, len(f)))
             return c[0] if c else None
-        c = os.environ.get("DEUX_CKPT") or pick((".ckpt", ".pth", ".pt"))
-        y = os.environ.get("DEUX_CONFIG") or pick((".yaml", ".yml"))
+        c = os.environ.get("DEUX_CKPT") or pick("becruily_deux.ckpt", (".ckpt", ".pth", ".pt"))
+        y = os.environ.get("DEUX_CONFIG") or pick("config_deux_becruily.yaml", (".yaml", ".yml"))
         if not c or not y:
             raise RuntimeError("model files not found in %s: %s" % (DEUX_REPO, files))
         if not os.path.exists(cfg):
@@ -725,7 +738,7 @@ def main():
             reply({"id": rid, "ok": True, "output": req["output"], "sec": round(time.time() - t0, 2)})
         except Exception as e:
             traceback.print_exc()
-            reply({"id": rid, "ok": False, "error": str(e)[:400]})
+            reply({"id": rid, "ok": False, "error": ("%s: %s" % (type(e).__name__, e))[:400]})
 
 if __name__ == "__main__":
     try:
@@ -736,30 +749,44 @@ if __name__ == "__main__":
         sys.exit(1)
 `;
 
-const SEP = { workers: [], queue: [], jobs: new Map(), bad: new Map(), model: null, fallback: false, broken: null, seq: 0, done: 0, failed: 0, totalSec: 0 };
+const SEP = {
+  workers: [], queue: [], jobs: new Map(), bad: new Map(), errors: [],
+  engine: null, account: null, model: null, fallback: false, useFallback: false, broken: null, sepFails: 0,
+  seq: 0, done: 0, failed: 0, totalSec: 0,
+};
 const sepAlive = () => SEP.workers.some((w) => w.alive);
+const STAGES = { download: 'превью', convert: 'ffmpeg', separate: 'нейросеть', encode: 'ffmpeg', memory: 'память', model: 'модель' };
+const mmss = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+/** Последние ошибки — видны в админке, причина попадает и в сообщение об остановке игры. */
+function sepError(stage, track, message) {
+  SEP.errors.unshift({ at: now(), stage, title: track?.title || '', message: cut(String(message), 300) });
+  SEP.errors.length = Math.min(SEP.errors.length, 5);
+}
 
 class SepWorker {
   constructor(n) {
-    Object.assign(this, { n, seq: 0, pending: new Map(), alive: false, busy: false, everReady: false, fails: 0, stopped: false });
+    Object.assign(this, { n, seq: 0, pending: new Map(), alive: false, busy: false, everReady: false, fails: 0, stopped: false, restarting: false, killedByUs: false, job: null });
     this.start();
   }
 
   start() {
-    this.alive = false; this.everReady = false;
+    this.alive = false; this.everReady = false; this.killedByUs = false;
+    const model = SEP.useFallback ? CFG.sepFallback : CFG.sepModel;
     const proc = spawn(CFG.python, ['-u', WORKER_FILE], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
-        ...process.env, PYTHONUNBUFFERED: '1', SEP_MODEL: CFG.sepModel, SEP_FALLBACK_MODEL: CFG.sepFallback,
+        ...process.env, PYTHONUNBUFFERED: '1', SEP_MODEL: model, SEP_FALLBACK_MODEL: CFG.sepFallback,
         SEP_MODEL_DIR: DIRS.models, SEP_WORK_DIR: path.join(DIRS.tmp, `sep${this.n}`),
       },
     });
     this.proc = proc;
+    proc.stdin.on('error', () => {}); // EPIPE, если процесс уже умер
     readline.createInterface({ input: proc.stdout }).on('line', (l) => this.onLine(l));
     readline.createInterface({ input: proc.stderr }).on('line', (raw) => {
       const l = raw.split('\r').pop().trim();
       if (!l || /\d+%\|/.test(l)) return; // прогресс-бары tqdm
-      (/\[sep\]|error|exception|traceback|failed/i.test(l) ? log.info : log.debug)(`[sep${this.n}] ${cut(l, 400)}`);
+      (/\[sep\]|error|exception|traceback|failed|killed/i.test(l) ? log.info : log.debug)(`[sep${this.n}] ${cut(l, 400)}`);
     });
     proc.on('error', (err) => {
       log.error(`[sep${this.n}] ${err.message}`);
@@ -767,16 +794,20 @@ class SepWorker {
     });
     proc.on('exit', (code, sig) => {
       this.alive = false;
-      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error(`worker exited (${code ?? sig})`)); }
+      const oom = sig === 'SIGKILL' && !this.killedByUs;
+      const reason = oom ? 'процесс нейросети убит системой — похоже, не хватает RAM' : `worker exited (${code ?? sig})`;
+      if (oom) sepError('memory', this.job?.track, reason);
+      for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(Object.assign(new Error(reason), { crash: true, oom })); }
       this.pending.clear();
       if (this.stopped || SEP.broken) return;
+      if (this.restarting) { this.restarting = false; setTimeout(() => this.start(), 500).unref(); return; }
       this.fails = this.everReady ? 0 : this.fails + 1;
       if (this.fails >= 3) {
-        SEP.broken = 'нейросеть не запускается — смотри логи контейнера';
+        SEP.broken = `нейросеть не запускается: ${SEP.errors[0]?.message || 'смотри логи контейнера'}`;
         log.error(`[sep${this.n}] ${SEP.broken}`); pump(); return;
       }
       const delay = Math.min(60, 5 * 2 ** this.fails);
-      log.warn(`[sep${this.n}] exited (${code ?? sig}), restart in ${delay}s`);
+      log.warn(`[sep${this.n}] ${reason}, restart in ${delay}s`);
       setTimeout(() => this.start(), delay * 1000).unref();
     });
   }
@@ -786,8 +817,8 @@ class SepWorker {
     try { m = JSON.parse(line); } catch { log.debug(`[sep${this.n}] ${line}`); return; }
     if (m.ready) {
       Object.assign(this, { alive: true, everReady: true, fails: 0 });
-      SEP.model = m.model; SEP.fallback = !!m.fallback;
-      log.info(`[sep${this.n}] ready · ${m.model}${m.fallback ? ' (запасная модель)' : ''}`);
+      SEP.model = m.model; SEP.fallback = !!m.fallback || m.model === CFG.sepFallback;
+      log.info(`[sep${this.n}] ready · ${m.model}${SEP.fallback ? ' (запасная модель)' : ''}`);
       pump(); return;
     }
     const p = this.pending.get(m.id);
@@ -798,20 +829,157 @@ class SepWorker {
 
   separate(input, output) {
     return new Promise((resolve, reject) => {
+      if (!this.alive) { reject(Object.assign(new Error('worker restarting'), { crash: true })); return; }
       const id = ++this.seq;
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('separation timeout')); this.kill(); }, CFG.sepTimeout * 1000);
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`нейросеть не уложилась в ${CFG.sepTimeout} сек — слабый CPU?`));
+        this.kill();
+      }, CFG.sepTimeout * 1000);
       this.pending.set(id, { resolve, reject, timer });
       this.proc.stdin.write(`${JSON.stringify({ id, input, output })}\n`);
     });
   }
 
-  kill() { try { this.proc.kill('SIGKILL'); } catch { /* ok */ } }
+  kill() { this.killedByUs = true; this.alive = false; try { this.proc.kill('SIGKILL'); } catch { /* ok */ } }
+  restart() { this.restarting = true; this.kill(); }
   stop() { this.stopped = true; this.kill(); }
 }
 
+/* ─────────── MVSEP: облачное отделение вокала (mvsep.com API) ─────────── */
+// Тот же Mel-Roformer deux от becruily, но на их серверах: RAM на VPS не нужна.
+// Бесплатный аккаунт: 1 задача одновременно, обычная очередь. Premium — без ограничений.
+
+const MVSEP_LABELS = { '48:11': 'MelBand Roformer · becruily deux', '48:7': 'MelBand Roformer · becruily instrum', '48:4': 'MelBand Roformer 2024.10', '40:81': 'BS Roformer' };
+const mvsepLabel = () => `MVSEP · ${MVSEP_LABELS[`${CFG.mvsep.sepType}:${CFG.mvsep.opt1}`] || `sep_type ${CFG.mvsep.sepType}${CFG.mvsep.opt1 ? `/${CFG.mvsep.opt1}` : ''}`}`;
+
+function pickStem(files) {
+  const named = files.map((f) => ({ f, n: `${f.download || ''} ${f.type || ''} ${f.url || ''}`.toLowerCase() }));
+  return (named.find((x) => /instrum/.test(x.n))
+    || named.find((x) => /other|no_?vocals|karaoke|accomp/.test(x.n))
+    || named.find((x) => !/vocal/.test(x.n)))?.f || null;
+}
+
+class MvsepWorker {
+  constructor(n) {
+    Object.assign(this, { n, alive: true, busy: false, job: null, remote: null, inExt: 'flac', outExt: 'mp3' });
+  }
+
+  async api(pathname, { method = 'GET', body, timeout = 30e3 } = {}) {
+    const res = await fetch(`${CFG.mvsep.host}/api/${pathname}`, { method, body, signal: AbortSignal.timeout(timeout) });
+    let j = {};
+    try { j = await res.json(); } catch { /* не JSON */ }
+    if (res.status === 401) {
+      SEP.broken = 'MVSEP: неверный MVSEP_TOKEN'; pump();
+      throw new Error(SEP.broken);
+    }
+    return { status: res.status, j };
+  }
+
+  async separate(input, output) {
+    const m = CFG.mvsep;
+    let hash = null;
+    for (let attempt = 0; attempt < 8 && !hash; attempt++) {
+      const fd = new FormData();
+      fd.append('api_token', m.token);
+      fd.append('sep_type', m.sepType);
+      if (m.opt1) fd.append('add_opt1', m.opt1);
+      if (m.opt2) fd.append('add_opt2', m.opt2);
+      fd.append('output_format', '0'); // mp3 320
+      fd.append('is_demo', '0');
+      fd.append('audiofile', await fs.openAsBlob(input), `noliric_${crypto.randomBytes(4).toString('hex')}.${this.inExt}`);
+      let r;
+      try { r = await this.api('separation/create', { method: 'POST', body: fd, timeout: 90e3 }); } catch (err) {
+        if (SEP.broken) throw err;
+        await sleep(3000); continue;
+      }
+      if (r.j?.success && r.j.data?.hash) { hash = r.j.data.hash; break; }
+      const msg = r.j?.data?.message || r.j?.message || `HTTP ${r.status}`;
+      // 429 / «уже есть активная задача» на бесплатном аккаунте — ждём и пробуем снова
+      if (r.status === 429 || r.status >= 500 || /concurrent|already|limit|queue|wait/i.test(msg)) { await sleep(5000 + attempt * 2000); continue; }
+      throw new Error(`MVSEP: ${msg}`);
+    }
+    if (!hash) throw new Error('MVSEP не принял задачу (лимит одновременных задач?)');
+
+    const deadline = now() + CFG.sepTimeout * 1000;
+    for (;;) {
+      await sleep(m.poll * 1000);
+      if (now() > deadline) throw new Error(`MVSEP не успел за ${CFG.sepTimeout} сек — очередь перегружена`);
+      let r;
+      try { r = await this.api(`separation/get?hash=${encodeURIComponent(hash)}`, { timeout: 20e3 }); } catch (err) {
+        if (SEP.broken) throw err;
+        continue;
+      }
+      const d = r.j?.data || {};
+      const status = r.j?.status || d.status;
+      this.remote = { status, order: d.current_order ?? null, queue: d.queue_count ?? null };
+      if (status === 'done') {
+        const stem = pickStem(Array.isArray(d.files) ? d.files : Object.values(d.files || {}));
+        if (!stem?.url) throw new Error('MVSEP: в ответе нет инструментала');
+        const res = await fetch(String(stem.url).replace(/\\\//g, '/'), { signal: AbortSignal.timeout(60e3) });
+        if (!res.ok) throw new Error(`MVSEP download HTTP ${res.status}`);
+        await fsp.writeFile(output, Buffer.from(await res.arrayBuffer()));
+        this.remote = null;
+        return { ok: true };
+      }
+      if (['failed', 'error', 'not_found'].includes(status)) throw new Error(`MVSEP: ${d.message || status}`);
+    }
+  }
+
+  kill() {} restart() {} stop() { this.alive = false; }
+}
+
+async function checkMvsep() {
+  try {
+    const res = await fetch(`${CFG.mvsep.host}/api/app/user?api_token=${encodeURIComponent(CFG.mvsep.token)}`, { signal: AbortSignal.timeout(15e3) });
+    if (res.status === 401) { SEP.broken = 'MVSEP: неверный MVSEP_TOKEN'; log.error(SEP.broken); return; }
+    const j = await res.json().catch(() => ({}));
+    const u = j.data || j;
+    SEP.account = { premium: !!Number(u.premium_enabled), credits: u.premium_minutes ?? null, name: u.name || null };
+    log.info(`MVSEP: ${u.name || 'аккаунт'} · premium ${SEP.account.premium ? 'вкл' : 'выкл'}${SEP.account.credits != null ? ` · кредитов ${SEP.account.credits}` : ''}`);
+  } catch (err) { log.warn(`MVSEP check: ${err.message}`); }
+}
+
 function startSeparator() {
+  if (CFG.sepEngine === 'mvsep' && CFG.mvsep.token) {
+    SEP.engine = 'mvsep'; SEP.model = mvsepLabel();
+    for (let i = 0; i < Math.max(1, CFG.mvsep.concurrency); i++) SEP.workers.push(new MvsepWorker(i + 1));
+    log.info(`separator: ${SEP.model} · задач одновременно: ${SEP.workers.length}`);
+    checkMvsep();
+    return;
+  }
+  if (CFG.sepEngine === 'mvsep') log.warn('MVSEP_TOKEN не задан — пробую локальную модель');
+  SEP.engine = 'local';
   fs.writeFileSync(WORKER_FILE, WORKER_PY);
   for (let i = 0; i < CFG.sepWorkers; i++) SEP.workers.push(new SepWorker(i + 1));
+}
+
+/** Статус задачи для анимированного черновика. */
+function jobStatus(key) {
+  if (!sepAlive()) return 'Загружаю нейросеть';
+  const pos = queuePos(key);
+  if (pos > 1) return `В очереди · ${pos}`;
+  const w = SEP.workers.find((x) => x.job?.key === key);
+  if (w?.remote?.status === 'waiting' || w?.remote?.status === 'distributing') {
+    return w.remote.order ? `Очередь MVSEP · ${w.remote.order}` : 'Очередь MVSEP';
+  }
+  return 'Отделяю вокал';
+}
+
+/** Основная модель падает на треках → переключаемся на запасную из реестра audio-separator. */
+function onSeparationFailure(err) {
+  if (SEP.engine !== 'local') return; // облако: сбои разовые, игра просто берёт другой трек
+  SEP.sepFails++;
+  const onFallback = SEP.useFallback || SEP.fallback;
+  if (!onFallback && CFG.sepFallback && SEP.sepFails >= 2 && !err.oom) {
+    SEP.useFallback = true; SEP.sepFails = 0;
+    sepError('model', null, `${SEP.model} падает на треках — переключаюсь на ${CFG.sepFallback}`);
+    log.warn(`switching to fallback model ${CFG.sepFallback}`);
+    for (const w of SEP.workers) w.restart();
+  } else if (SEP.sepFails >= 4) {
+    SEP.broken = err.oom ? 'не хватает оперативной памяти для нейросети' : `нейросеть не справляется: ${cut(err.message, 160)}`;
+    log.error(SEP.broken); pump();
+  }
 }
 
 function pump() {
@@ -820,8 +988,11 @@ function pump() {
     if (!w.alive || w.busy || !SEP.queue.length) continue;
     SEP.queue.sort((a, b) => a.priority - b.priority || a.seq - b.seq);
     const job = SEP.queue.shift();
-    w.busy = true; job.started = now();
-    processJob(w, job).then(job.resolve, job.reject).finally(() => { w.busy = false; setImmediate(pump); });
+    w.busy = true; w.job = job; job.started = now();
+    processJob(w, job).then(job.resolve, (err) => {
+      if (err.crash && !err.oom && (job.retries = (job.retries || 0) + 1) <= 2) { job.started = 0; SEP.queue.push(job); return; }
+      job.reject(err);
+    }).finally(() => { w.busy = false; w.job = null; setImmediate(pump); });
   }
 }
 
@@ -836,7 +1007,7 @@ function requestInstrumental(track, priority = 5) {
   const cached = cacheGet(track.key);
   if (cached) return Promise.resolve(cached);
   const bad = SEP.bad.get(track.key);
-  if (bad && now() - bad < 3600e3) return Promise.reject(new Error('трек недоступен'));
+  if (bad && now() - bad < 3600e3) return Promise.reject(new Error('превью трека недоступно'));
   if (SEP.broken) return Promise.reject(new Error(SEP.broken));
   let job = SEP.jobs.get(track.key);
   if (job) { if (priority < job.priority) job.priority = priority; return job.promise; }
@@ -844,7 +1015,7 @@ function requestInstrumental(track, priority = 5) {
   job.promise = new Promise((res, rej) => { job.resolve = res; job.reject = rej; });
   job.promise.then(
     () => SEP.jobs.delete(track.key),
-    (err) => { SEP.jobs.delete(track.key); if (!/worker exited|timeout|нейросеть|не найден/i.test(err.message)) SEP.bad.set(track.key, now()); },
+    (err) => { SEP.jobs.delete(track.key); if (err.stage === 'download') SEP.bad.set(track.key, now()); },
   );
   SEP.jobs.set(track.key, job); SEP.queue.push(job); pump();
   return job.promise;
@@ -855,45 +1026,63 @@ const safeKey = (k) => k.replace(/[^a-z0-9_-]/gi, '_');
 async function processJob(worker, job) {
   const t = job.track; const started = now();
   const base = path.join(DIRS.tmp, `${safeKey(t.key)}_${crypto.randomBytes(3).toString('hex')}`);
-  const raw = `${base}.src`; const wav = `${base}.wav`; const inst = `${base}_inst.wav`;
+  const raw = `${base}.src`; const wav = `${base}.${worker.inExt || 'wav'}`; const inst = `${base}_inst.${worker.outExt || 'wav'}`;
   const out = path.join(DIRS.cache, `${safeKey(t.key)}.mp3`);
+  let stage = 'download';
   try {
     await downloadPreview(t, raw);
-    await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', raw, '-vn', '-ac', '2', '-ar', '44100', wav]);
+    stage = 'convert'; // в нейросеть идёт только окно SEP_WINDOW сек — быстрее на CPU
+    const total = (await probeDuration(raw)) || 30;
+    const win = Math.min(total, CFG.sepWindow);
+    const off = Math.max(0, Math.random() * (total - win));
+    await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-ss', off.toFixed(2), '-t', win.toFixed(2), '-i', raw, '-vn', '-ac', '2', '-ar', '44100', wav]);
+    stage = 'separate';
     await worker.separate(wav, inst);
+    stage = 'encode';
     await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', inst, '-c:a', 'libmp3lame', '-b:a', '256k', '-map_metadata', '-1', out]);
     const { size } = await fsp.stat(out);
     Q.cachePut.run({ key: t.key, path: out, model: SEP.model, bytes: size, now: now() });
-    SEP.done++; SEP.totalSec += (now() - started) / 1000;
-    log.debug(`separated ${t.key} «${t.title}» in ${((now() - started) / 1000).toFixed(1)}s`);
+    SEP.done++; SEP.sepFails = 0; SEP.totalSec += (now() - started) / 1000;
+    log.info(`separated «${t.title}» in ${((now() - started) / 1000).toFixed(1)}s · ${SEP.model}`);
     return out;
   } catch (err) {
-    SEP.failed++;
-    log.warn(`separate ${t.key}: ${err.message}`);
+    SEP.failed++; err.stage = stage;
+    log.warn(`separate ${t.key} «${t.title}» [${stage}]: ${err.message}`);
+    const restart = err.crash && !err.oom; // воркер перезапускался — задача вернётся в очередь
+    if (!err.oom && !restart) sepError(stage, t, err.message);
+    if (stage === 'separate' && !restart) onSeparationFailure(err);
     throw err;
   } finally {
     for (const f of [raw, wav, inst]) fs.rm(f, { force: true }, () => {});
   }
 }
 
+async function fetchAudio(url, dst) {
+  const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 noliric-bot' }, signal: AbortSignal.timeout(30e3) });
+  if (!res.ok) throw new Error(`превью HTTP ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length < 20_000) throw new Error('превью пустое');
+  await fsp.writeFile(dst, buf);
+}
+
+/** Превью: исходная ссылка → свежая ссылка → тот же трек в iTunes (если Deezer CDN недоступен). */
 async function downloadPreview(t, dst) {
-  let url = t.preview;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const errors = [];
+  try { return await fetchAudio(t.preview, dst); } catch (err) { errors.push(err.message); }
+  try {
+    const fresh = await PROVIDERS[t.src].freshPreview(t);
+    if (fresh && fresh !== t.preview) { t.preview = fresh; return await fetchAudio(fresh, dst); }
+  } catch (err) { errors.push(err.message); }
+  if (t.src !== 'it') {
     try {
-      const res = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 noliric-bot' }, signal: AbortSignal.timeout(30e3) });
-      if (!res.ok) throw new Error(`preview HTTP ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length < 20_000) throw new Error('preview too small');
-      await fsp.writeFile(dst, buf);
-      return;
-    } catch (err) {
-      if (attempt === 0) { // подписанная ссылка Deezer могла протухнуть
-        const fresh = await PROVIDERS[t.src].freshPreview(t).catch(() => null);
-        if (fresh) { t.preview = fresh; url = fresh; continue; }
-      }
-      throw err;
-    }
+      const d = await ITunes.req(`/search?term=${encodeURIComponent(`${t.artist} ${baseTitle(t.title)}`)}&entity=song&limit=10`);
+      const want = canon(baseTitle(t.title));
+      const hit = (d.results || []).find((r) => r.previewUrl && canon(baseTitle(r.trackName)) === want);
+      if (hit) { await fetchAudio(hit.previewUrl, dst); log.info(`preview «${t.title}» взято из iTunes`); return; }
+      errors.push('в iTunes не найден');
+    } catch (err) { errors.push(`iTunes: ${err.message}`); }
   }
+  throw new Error(errors.join(' · '));
 }
 
 function cacheGet(key) {
@@ -1002,7 +1191,7 @@ class Game {
     Object.assign(this, {
       uid, chatId, item, pool, cardId, mode: MODES[mode],
       queue: shuffle(pool.tracks.slice()), wanted: MODES[mode].endless ? Infinity : rounds,
-      score: 0, correct: 0, wrong: 0, streak: 0, bestStreak: 0, misses: 0, failed: 0,
+      score: 0, correct: 0, wrong: 0, streak: 0, bestStreak: 0, misses: 0, failRow: 0,
       history: [], i: 0, cur: null, stopped: false, reason: null, noDraft: false, waiter: null,
     });
     this.performer = pool.artist || pool.name;
@@ -1068,12 +1257,15 @@ class Game {
         const file = await this.waitWithStatus(want);
         if (!file || this.stopped) return null;
         const [a, b] = this.mode.clip;
-        return { track, ...(await makeClip(file, a + crypto.randomInt(b - a + 1))) };
+        const clipInfo = await makeClip(file, a + crypto.randomInt(b - a + 1));
+        this.failRow = 0;
+        return { track, ...clipInfo };
       } catch (err) {
         if (SEP.broken) throw new Error(`отделение вокала недоступно: ${SEP.broken}`);
         log.warn(`game ${this.id}: skip ${track.key} — ${err.message}`);
         this.queue.splice(this.i, 1);
-        if (++this.failed > 8) throw new Error('слишком много треков не удалось обработать');
+        this.lastError = err.message;
+        if (++this.failRow >= 3) throw new Error(`3 трека подряд не обработались. Причина: ${cut(err.message, 160)}`);
       }
     }
     return null;
@@ -1086,12 +1278,12 @@ class Game {
     const key = this.queue[this.i]?.key;
     const label = this.mode.endless ? `Трек ${this.history.length + 1} · серия ${this.streak}` : `Раунд ${this.i + 1} из ${this.total}`;
     const draftId = crypto.randomInt(1, 2 ** 31 - 1);
-    let n = 0; let live = true;
+    let n = 0; let live = true; const since = now();
+    const retry = this.failRow ? ` · другой трек (${this.failRow + 1}/3)` : '';
     const tick = async () => {
       if (!live || this.stopped) return;
-      const pos = queuePos(key);
-      const status = !sepAlive() ? 'Загружаю нейросеть' : pos > 1 ? `В очереди · ${pos}` : 'Отделяю вокал';
-      const text = `${e('loading')} <b>${status}${'.'.repeat((n++ % 3) + 1)}</b>\n<i>${label}</i>`;
+      const status = jobStatus(key);
+      const text = `${e('loading')} <b>${status}${'.'.repeat((n++ % 3) + 1)}</b> ${mmss(now() - since)}\n<i>${label}${retry}</i>`;
       if (!this.noDraft) {
         try { await tg('sendMessageDraft', { chat_id: this.chatId, draft_id: draftId, text, parse_mode: 'HTML' }, { retries: 0 }); return; } catch (err) {
           if (err.code === 400 || err.code === 404) this.noDraft = true;
@@ -1512,9 +1704,12 @@ function adminScreen() {
       `Пользователи: <b>${fmt(s.users)}</b> · за сутки ${fmt(s.users24)} · заблокировали ${fmt(s.blocked)}`,
       `Игры: <b>${fmt(s.games)}</b> · за сутки ${fmt(s.games24)} · сейчас ${games.size}`,
       `Модель: <code>${esc(SEP.model || 'загружается')}</code>${SEP.fallback ? ' (запасная)' : ''}`,
+      SEP.account ? `MVSEP: ${SEP.account.premium ? 'premium' : 'бесплатный'}${SEP.account.credits != null ? ` · кредитов ${fmt(SEP.account.credits)}` : ''}` : null,
       `Нейросеть: ${alive}/${SEP.workers.length} · очередь ${SEP.queue.length} · готово ${fmt(SEP.done)} · ошибок ${fmt(SEP.failed)}${avg}`,
+      ...SEP.workers.filter((w) => w.job).map((w) => `В работе: «${esc(cut(w.job.track.title, 40))}» · ${mmss(now() - w.job.started)}${w.remote?.status ? ` · ${w.remote.status}${w.remote.order ? ` #${w.remote.order}` : ''}` : ''}`),
       SEP.broken ? `<b>Ошибка:</b> ${esc(SEP.broken)}` : null,
       `Кэш: ${fmt(c.n)} инструм. · ${(c.bytes / 1048576).toFixed(0)} / ${fmt(CFG.cacheMaxMb)} МБ`,
+      SEP.errors.length ? `\n<b>Последние ошибки</b>\n<blockquote expandable>${SEP.errors.map((x) => `${mmss(now() - x.at)} назад · ${STAGES[x.stage] || x.stage}${x.title ? ` · «${esc(cut(x.title, 30))}»` : ''}\n${esc(x.message)}`).join('\n\n')}</blockquote>` : null,
       `Эмодзи-пак: ${PACK.loaded ? `${PACK.stickers.length} шт.` : 'не загружен'}`,
     ].filter((x) => x !== null).join('\n'),
     rows: [
