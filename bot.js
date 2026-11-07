@@ -43,7 +43,7 @@ const CFG = {
   sepWorkers: Math.max(1, envInt('SEP_WORKERS', 1)),
   sepTimeout: Math.max(60, envInt('SEP_TIMEOUT', 420)),
   sepWindow: Math.min(30, Math.max(12, envInt('SEP_WINDOW', 22))),
-  sepEngine: env('SEP_ENGINE', 'mvsep').toLowerCase(),
+  sepEngine: env('SEP_ENGINE', 'local').toLowerCase(),
   mvsep: {
     token: env('MVSEP_TOKEN'),
     host: env('MVSEP_HOST', 'https://mvsep.com').replace(/\/+$/, ''),
@@ -58,7 +58,7 @@ const CFG = {
   rich: env('RICH_MESSAGES', '1') !== '0',
   logLevel: env('LOG_LEVEL', 'info'),
 };
-const DIRS = { cache: path.join(DATA_DIR, 'cache'), tmp: path.join(DATA_DIR, 'tmp'), models: path.join(DATA_DIR, 'models') };
+const DIRS = { cache: path.join(DATA_DIR, 'cache'), tmp: path.join(DATA_DIR, 'tmp'), models: path.resolve(__dirname, env('SEP_MODEL_DIR', path.join(DATA_DIR, 'models'))) };
 const WORKER_FILE = path.join(DATA_DIR, 'separator_worker.py');
 
 /* ═══════════════════════════ utils ═══════════════════════════ */

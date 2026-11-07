@@ -20,8 +20,8 @@ PREFETCH=2
 RICH_MESSAGES=1
 
 # ─── Отделение вокала ───
-# mvsep — облако mvsep.com (без нагрузки на VPS) | local — нейросеть на своём CPU
-SEP_ENGINE=mvsep
+# local — нейросеть на своём CPU (модель уже в образе) | mvsep — облако mvsep.com
+SEP_ENGINE=local
 SEP_TIMEOUT=420
 # сколько секунд превью отправлять на обработку (12–30)
 SEP_WINDOW=22
@@ -35,8 +35,7 @@ MVSEP_OPT1=11
 MVSEP_CONCURRENCY=1
 MVSEP_POLL_SEC=3
 
-# Локально (нужен образ с --build-arg LOCAL_SEPARATOR=1):
-# лёгкая MDX-Net ONNX ≈ 1 ГБ RAM; «deux» — тяжёлый Roformer, нужно 4+ ГБ RAM
+# Локально: лёгкая MDX-Net ONNX ≈ 1 ГБ RAM; «deux» — тяжёлый Roformer, нужно 4+ ГБ RAM
 SEP_MODEL=UVR-MDX-NET-Inst_HQ_4.onnx
 SEP_FALLBACK_MODEL=UVR-MDX-NET-Inst_HQ_3.onnx
 SEP_WORKERS=1
